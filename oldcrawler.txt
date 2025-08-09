@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+# Prevent purging of storage between runs to maintain change detection state
+import os
+os.environ['CRAWLEE_PURGE_ON_START'] = '0'
+os.environ['PURGE_ON_START'] = '0'
+
+"""
+Web Crawler with Change Detection
+
+This crawler scrapes websites and generates FAQs using Gemini AI. It includes intelligent
+change detection to avoid re-processing pages that haven't been updated since the last run.
+
+Change Detection Logic:
+- Extracts Last-Modified and ETag headers from HTTP responses
+- Computes SHA256 hash of page content as fallback
+- Creates composite identifier combining all change indicators
+- Stores identifiers in Apify key-value store using URL hash as key
+- Skips pages where current identifier matches stored identifier
+
+File Naming:
+- Markdown files: {domain}_{page_name}.md (e.g., inhotel_about.md)
+- FAQ files: {domain}_{page_name}_faq.md (e.g., inhotel_about_faq.md)
+"""
+
+import asyncio
+import hashlib
+import json
+from typing import List
+from urllib.parse import urlparse
+
+import dotenv
+
+from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
+from apify import Actor
+from markdownify import markdownify as md
+from google import genai
+
+
+dotenv.load_dotenv()
+
+
+def generate_faq_from_markdown(md_path: str, model_name: str = "gemini-1.5-flash") -> str:
+    """Generate a FAQ from a markdown file using Gemini and save it as a new markdown file in storage/datasets/faqs.
+    
+    The format of the FAQ is:
+    ### Question 1
+    Answer 1\n
+    ### Question 2
+    Answer 2\n
+    ...
+    ### Question n
+    Answer n
+    """
+    import os
+    api_key = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_GENERATIVE_AI_API_KEY not found in environment variables.")
+    client = genai.Client(api_key=api_key)
+    with open(md_path, "r", encoding="utf-8") as f:
+        markdown_content = f.read()
+    prompt = (
+        """
+        You are an expert at summarizing website content and generating helpful FAQs for users.\n
+        Given the following page content in markdown, generate a concise FAQ (5-10 Q&A pairs) that covers the most important and relevant information for a user.\n
+        Format the output as markdown, with each question as a bold heading and the answer as a paragraph below.\n
+        Markdown content:\n\n""" + markdown_content
+    )
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt
+    )
+    faq_md = response.text
+    # Save FAQ markdown file in a separate directory
+    faq_dir = os.path.join("storage", "datasets", "faqs")
+    os.makedirs(faq_dir, exist_ok=True)
+    base_name = os.path.basename(md_path).replace(".md", "_faq.md")
+    faq_path = os.path.join(faq_dir, base_name)
+    with open(faq_path, "w", encoding="utf-8") as f:
+        f.write(faq_md)
+    return faq_path
+
+
+async def main() -> None:
+    """
+    Main entry point for the crawler.
+    """
+    async with Actor:
+        # Retrieve Actor input or provide default start URL
+        actor_input = await Actor.get_input() or {}
+        start_urls: List[str] = [
+            url.get("url")
+            for url in actor_input.get("start_urls", [{"url": "https://www.inhotel.io/"}])
+        ]
+
+        # Extract the base domain from the first start URL
+        parsed_url = urlparse(start_urls[0])
+        base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+        if not start_urls:
+            Actor.log.info("No start URLs provided, exiting.")
+            await Actor.exit()
+
+        # Create a persistent file-based change detection system
+        change_detection_file = os.path.join("storage", "change_detection.json")
+        os.makedirs(os.path.dirname(change_detection_file), exist_ok=True)
+        
+        # Load existing change detection data
+        try:
+            with open(change_detection_file, 'r') as f:
+                change_detection_data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            change_detection_data = {}
+        
+        Actor.log.info(f"Loaded change detection data for {len(change_detection_data)} URLs")
+        
+        # Initialize counters for summary
+        processed_count = 0
+        skipped_count = 0
+        
+
+
+        # Create the crawler
+        crawler = PlaywrightCrawler(
+            max_requests_per_crawl=5000,
+            headless=True,
+            browser_launch_options={
+                "args": ["--disable-gpu"],
+            },
+        )
+
+        # Define request handler
+        @crawler.router.default_handler
+        async def handle_request(context: PlaywrightCrawlingContext) -> None:
+            nonlocal processed_count, skipped_count
+            url = context.request.url
+            page = context.page
+
+            Actor.log.info(f"Visiting {url}")
+
+            # Try to get various HTTP headers for change detection
+            response = context.response
+            last_modified = response.headers.get("last-modified")
+            etag = response.headers.get("etag")
+            
+            # Compute content hash
+            content = await page.content()
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+            # Create a composite identifier that includes multiple change indicators
+            identifier_parts = []
+            if last_modified:
+                identifier_parts.append(f"last_modified:{last_modified}")
+            if etag:
+                identifier_parts.append(f"etag:{etag}")
+            identifier_parts.append(f"content_hash:{content_hash}")
+            
+            # Join all parts to create a comprehensive identifier
+            identifier = "|".join(identifier_parts)
+
+            # Use the URL as the key for the file-based change detection
+            stored_identifier = change_detection_data.get(url)
+            
+            Actor.log.info(f"Change detection for {url}:")
+            Actor.log.info(f"  - Last-Modified: {last_modified}")
+            Actor.log.info(f"  - ETag: {etag}")
+            Actor.log.info(f"  - Content hash: {content_hash[:16]}...")
+            Actor.log.info(f"  - Using identifier: {identifier}")
+            Actor.log.info(f"  - Stored identifier: {stored_identifier}")
+            Actor.log.info(f"  - Is first visit: {stored_identifier is None}")
+
+            if stored_identifier and stored_identifier == identifier:
+                Actor.log.info(f"No changes detected for {url}. Skipping processing.")
+                Actor.log.info(f"  - Previous identifier: {stored_identifier}")
+                Actor.log.info(f"  - Current identifier: {identifier}")
+                skipped_count += 1
+                # Still enqueue links to discover new pages, but don't process this page
+                await context.enqueue_links()
+                return
+
+            Actor.log.info(f"Changes detected or new page for {url}. Processing...")
+            processed_count += 1
+
+            # Extract full HTML content
+            html_content = await page.content()
+            # Convert HTML to Markdown
+            markdown_content = md(html_content)
+
+            # Save Markdown to file in storage/datasets/page_content/
+            md_dir = os.path.join("storage", "datasets", "page_content")
+            os.makedirs(md_dir, exist_ok=True)
+            
+            # Generate filename from URL
+            parsed_url = urlparse(url)
+            path_parts = [part for part in parsed_url.path.strip('/').split('/') if part]
+            
+            if path_parts:
+                # Use the last path segment as the base name
+                base_name = path_parts[-1]
+                # Clean up the name (remove special characters, replace with underscores)
+                base_name = ''.join(c if c.isalnum() or c in '-_' else '_' for c in base_name)
+                # Remove multiple consecutive underscores
+                base_name = '_'.join(filter(None, base_name.split('_')))
+                # If base_name is empty or just underscores, use 'index'
+                if not base_name or base_name == '_':
+                    base_name = 'index'
+            else:
+                # For root URL, use 'index'
+                base_name = 'index'
+            
+            # Add domain prefix for organization
+            domain_parts = parsed_url.netloc.split('.')
+            # Use the main domain name (skip www if present)
+            if len(domain_parts) > 2 and domain_parts[0] == 'www':
+                domain_prefix = domain_parts[1]
+            else:
+                domain_prefix = domain_parts[0]
+            md_filename = f"{domain_prefix}_{base_name}.md"
+            md_path = os.path.join(md_dir, md_filename)
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(f"# {await page.title()}\n\n")
+                f.write(f"**URL:** {url}\n\n")
+                f.write(markdown_content)
+
+            # Generate FAQ using Gemini
+            try:
+                faq_path = generate_faq_from_markdown(md_path)
+                Actor.log.info(f"FAQ generated and saved to {faq_path}")
+            except Exception as e:
+                Actor.log.warning(f"Failed to generate FAQ for {md_path}: {e}")
+
+            # Save the current identifier to the file-based system
+            change_detection_data[url] = identifier
+            Actor.log.info(f"Saved identifier for {url}: {identifier}")
+
+            # Enqueue all links found on the page, regardless of domain
+            await context.enqueue_links()
+            Actor.log.info(f"Enqueued links from {url}")
+
+        # Start crawling
+        await crawler.run(start_urls)
+        
+        # Save change detection data to file
+        try:
+            with open(change_detection_file, 'w') as f:
+                json.dump(change_detection_data, f, indent=2)
+            Actor.log.info("Crawling completed. Markdown files saved to storage/datasets/page_content/")
+            Actor.log.info(f"Change detection data saved to {change_detection_file}")
+            Actor.log.info(f"Summary: {processed_count} pages processed, {skipped_count} pages skipped (no changes)")
+        except Exception as e:
+            Actor.log.warning(f"Could not save change detection data: {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+def page_data_to_markdown(page_data: dict) -> str:
+    """Convert a single page's data to a Markdown string."""
+    md = []
+    md.append(f"# {page_data.get('title', '')}\n")
+    md.append(f"**URL:** [{page_data.get('url', '')}]({page_data.get('url', '')})\n")
+    if page_data.get('h1s'):
+        for h1 in page_data['h1s']:
+            if h1: md.append(f"# {h1}\n")
+    if page_data.get('h2s'):
+        for h2 in page_data['h2s']:
+            if h2: md.append(f"## {h2}\n")
+    if page_data.get('h3s'):
+        for h3 in page_data['h3s']:
+            if h3: md.append(f"### {h3}\n")
+    if page_data.get('paragraphs'):
+        for p in page_data['paragraphs']:
+            if p: md.append(f"{p}\n")
+    if page_data.get('links'):
+        md.append("\n**Links:**\n")
+        for link in page_data['links']:
+            if link: md.append(f"- [{link}]({link})\n")
+    md.append("\n---\n")
+    return ''.join(md)
