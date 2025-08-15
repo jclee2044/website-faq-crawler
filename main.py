@@ -4,19 +4,19 @@ import glob
 import asyncio
 import hashlib
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
 from markdownify import markdownify as md
 from google import genai
 import dotenv
+from change_detection import change_detector
 
 # Load environment variables
 dotenv.load_dotenv()
 
-app = FastAPI(title="Website FAQ API", description="API for retrieving website FAQs and last updated information")
+app = FastAPI(title="Website FAQ API", description="API for retrieving website last updated times and generating FAQs")
 
 def generate_faq_from_markdown(md_path: str, model_name: str = "gemini-1.5-flash") -> str:
     """Generate FAQ from markdown content using Google Gemini AI"""
@@ -52,8 +52,8 @@ def generate_faq_from_markdown(md_path: str, model_name: str = "gemini-1.5-flash
     
     return faq_path
 
-async def crawl_and_generate_faq(url: str) -> Dict[str, str]:
-    """Crawl a single URL and generate FAQ for it"""
+async def crawl_and_generate_faq(url: str, skip_faq: bool = False) -> Dict[str, str]:
+    """Crawl a single URL and generate FAQ for it using advanced change detection"""
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--disable-gpu"])
@@ -62,27 +62,11 @@ async def crawl_and_generate_faq(url: str) -> Dict[str, str]:
             # Navigate to the page
             await page.goto(url, wait_until="networkidle")
             
-            # Get response headers
-            response = await page.context.request.get(url)
-            headers = response.headers if response else {}
-            
-            last_modified = headers.get("last-modified")
-            etag = headers.get("etag")
-            
-            # Get page content
-            content = await page.content()
-            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            
-            # Create identifier for change detection
-            identifier_parts = []
-            if last_modified:
-                identifier_parts.append(f"last_modified:{last_modified}")
-            if etag:
-                identifier_parts.append(f"etag:{etag}")
-            identifier_parts.append(f"content_hash:{content_hash}")
-            identifier = "|".join(identifier_parts)
+            # Use advanced change detection to analyze the page
+            analysis = await change_detector.analyze_page_content(page, url)
             
             # Convert to markdown
+            content = await page.content()
             markdown_content = md(content)
             
             # Save markdown content
@@ -102,10 +86,16 @@ async def crawl_and_generate_faq(url: str) -> Dict[str, str]:
                 f.write(f"**URL:** {url}\n\n")
                 f.write(markdown_content)
             
-            # Generate FAQ
-            faq_path = generate_faq_from_markdown(md_path)
+            # Generate FAQ only if not skipped
+            faq_path = None
+            if not skip_faq:
+                try:
+                    faq_path = generate_faq_from_markdown(md_path)
+                except Exception as e:
+                    print(f"FAQ generation failed: {e}")
+                    # Continue without FAQ generation
             
-            # Update change detection data
+            # Update change detection data with enhanced information
             change_detection_file = os.path.join("storage", "change_detection.json")
             os.makedirs(os.path.dirname(change_detection_file), exist_ok=True)
             
@@ -115,7 +105,17 @@ async def crawl_and_generate_faq(url: str) -> Dict[str, str]:
             except (FileNotFoundError, json.JSONDecodeError):
                 change_detection_data = {}
             
-            change_detection_data[url] = identifier
+            # Store enhanced change detection data
+            change_detection_data[url] = {
+                "identifier": analysis["identifier"],
+                "last_updated": analysis["last_updated"],
+                "timestamp_source": analysis["timestamp_source"],
+                "content_hash": analysis["content_hash"],
+                "structured_hash": analysis["structured_hash"],
+                "last_modified_header": analysis["last_modified_header"],
+                "etag_header": analysis["etag_header"],
+                "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
             
             with open(change_detection_file, 'w') as f:
                 json.dump(change_detection_data, f, indent=2)
@@ -124,10 +124,13 @@ async def crawl_and_generate_faq(url: str) -> Dict[str, str]:
             
             return {
                 "url": url,
-                "last_modified": last_modified,
+                "last_updated": analysis["last_updated"],
+                "timestamp_source": analysis["timestamp_source"],
                 "md_path": md_path,
                 "faq_path": faq_path,
-                "identifier": identifier
+                "identifier": analysis["identifier"],
+                "content_hash": analysis["content_hash"],
+                "structured_hash": analysis["structured_hash"],
             }
             
     except Exception as e:
@@ -166,25 +169,8 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50) -> List[Dict[
                     # Navigate to the page
                     await page.goto(current_url, wait_until="networkidle", timeout=30000)
                     
-                    # Get response headers
-                    response = await context.request.get(current_url)
-                    headers = response.headers if response else {}
-                    
-                    last_modified = headers.get("last-modified")
-                    etag = headers.get("etag")
-                    
-                    # Get page content
-                    content = await page.content()
-                    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                    
-                    # Create identifier for change detection
-                    identifier_parts = []
-                    if last_modified:
-                        identifier_parts.append(f"last_modified:{last_modified}")
-                    if etag:
-                        identifier_parts.append(f"etag:{etag}")
-                    identifier_parts.append(f"content_hash:{content_hash}")
-                    identifier = "|".join(identifier_parts)
+                    # Use advanced change detection to analyze the page
+                    analysis = await change_detector.analyze_page_content(page, current_url)
                     
                     # Convert to markdown
                     markdown_content = md(content)
@@ -209,15 +195,27 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50) -> List[Dict[
                     # Generate FAQ
                     faq_path = generate_faq_from_markdown(md_path)
                     
-                    # Update change detection data
-                    change_detection_data[current_url] = identifier
+                    # Update change detection data with enhanced information
+                    change_detection_data[current_url] = {
+                        "identifier": analysis["identifier"],
+                        "last_updated": analysis["last_updated"],
+                        "timestamp_source": analysis["timestamp_source"],
+                        "content_hash": analysis["content_hash"],
+                        "structured_hash": analysis["structured_hash"],
+                        "last_modified_header": analysis["last_modified_header"],
+                        "etag_header": analysis["etag_header"],
+                        "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    }
                     
                     crawled_urls.append({
                         "url": current_url,
-                        "last_modified": last_modified,
+                        "last_updated": analysis["last_updated"],
+                        "timestamp_source": analysis["timestamp_source"],
                         "md_path": md_path,
                         "faq_path": faq_path,
-                        "identifier": identifier
+                        "identifier": analysis["identifier"],
+                        "content_hash": analysis["content_hash"],
+                        "structured_hash": analysis["structured_hash"],
                     })
                     
                     crawled_count += 1
@@ -256,20 +254,66 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50) -> List[Dict[
     except Exception as e:
         raise Exception(f"Failed to crawl website {base_url}: {str(e)}")
 
-def get_change_detection_data() -> Dict[str, str]:
+def get_change_detection_data() -> Dict[str, Any]:
     """Load change detection data from crawler storage"""
     change_detection_file = os.path.join("storage", "change_detection.json")
     try:
         with open(change_detection_file, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+            
+        # Migrate legacy data to new format
+        migrated_data = {}
+        for url, value in data.items():
+            if isinstance(value, str):
+                # Legacy format - migrate to new format
+                migrated_data[url] = migrate_legacy_data(url, value)
+            else:
+                # Already in new format
+                migrated_data[url] = value
+        
+        # Save migrated data if any migration occurred
+        if migrated_data != data:
+            with open(change_detection_file, 'w') as f:
+                json.dump(migrated_data, f, indent=2)
+        
+        return migrated_data
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
+def migrate_legacy_data(url: str, legacy_identifier: str) -> Dict[str, Any]:
+    """Migrate legacy change detection data to new format"""
+    # Parse legacy identifier
+    parts = legacy_identifier.split("|")
+    legacy_data = {}
+    
+    for part in parts:
+        if ":" in part:
+            key, value = part.split(":", 1)
+            legacy_data[key] = value
+    
+    # Convert to new format
+    return {
+        "identifier": legacy_identifier,
+        "last_updated": legacy_data.get("last_modified"),
+        "timestamp_source": "http_header" if "last_modified" in legacy_data else "none",
+        "content_hash": legacy_data.get("content_hash"),
+        "structured_hash": None,  # Not available in legacy data
+        "last_modified_header": legacy_data.get("last_modified"),
+        "etag_header": legacy_data.get("etag"),
+        "crawl_timestamp": None,  # Not available in legacy data
+        "needs_recrawl": True,  # Flag to indicate this should be re-crawled
+    }
+
 def get_last_updated_from_identifier(identifier: str) -> Optional[str]:
-    """Extract last_modified timestamp from change detection identifier"""
+    """Extract last_modified timestamp from change detection identifier (legacy support)"""
     if not identifier:
         return None
     
+    # Handle new format (dictionary)
+    if isinstance(identifier, dict):
+        return identifier.get("last_updated")
+    
+    # Handle legacy format (string)
     parts = identifier.split("|")
     for part in parts:
         if part.startswith("last_modified:"):
@@ -371,37 +415,61 @@ def get_all_faqs_for_domain(base_url: str) -> List[Dict[str, str]]:
     return all_faqs
 
 @app.get("/last-updated")
-async def last_updated(url: str = Query(..., description="The URL to check for last updated time")):
+async def last_updated(
+    url: str = Query(..., description="The URL to check for last updated time"),
+    force_recrawl: bool = Query(False, description="Force re-crawl to use new change detection system")
+):
     """
     Get the last updated time for a specific URL.
     
     If the URL hasn't been crawled yet, it will be crawled automatically.
-    Returns the last_modified header timestamp if available, otherwise returns None.
+    Returns the most accurate last updated timestamp from multiple sources:
+    - Meta tags (highest priority)
+    - Content extraction
+    - HTTP headers (lowest priority)
     """
     change_data = get_change_detection_data()
     
-    if url not in change_data:
-        # URL not found, crawl it automatically
+    # Force re-crawl if requested or if URL not found
+    if force_recrawl or url not in change_data:
+        # URL not found or force recrawl requested, crawl it automatically
         try:
-            crawl_result = await crawl_and_generate_faq(url)
-            last_updated_time = crawl_result.get("last_modified")
+            crawl_result = await crawl_and_generate_faq(url, skip_faq=True)
+            last_updated_time = crawl_result.get("last_updated")
+            timestamp_source = crawl_result.get("timestamp_source")
             return {
                 "url": url, 
                 "last_updated": last_updated_time,
+                "timestamp_source": timestamp_source,
                 "has_been_crawled": True,
-                "just_crawled": True
+                "just_crawled": True,
+                "timestamp_reliability": "high" if last_updated_time else "unknown"
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to crawl URL: {str(e)}")
     
-    identifier = change_data[url]
-    last_updated_time = get_last_updated_from_identifier(identifier)
+    # URL exists and no force recrawl requested
+    url_data = change_data[url]
+    
+    # Handle both new and legacy data formats
+    if isinstance(url_data, dict):
+        last_updated_time = url_data.get("last_updated")
+        timestamp_source = url_data.get("timestamp_source")
+        crawl_timestamp = url_data.get("crawl_timestamp")
+    else:
+        # Legacy format
+        last_updated_time = get_last_updated_from_identifier(url_data)
+        timestamp_source = "legacy"
+        crawl_timestamp = None
     
     return {
         "url": url, 
         "last_updated": last_updated_time,
+        "timestamp_source": timestamp_source,
+        "crawl_timestamp": crawl_timestamp,
         "has_been_crawled": True,
-        "just_crawled": False
+        "just_crawled": False,
+        "timestamp_reliability": "high" if last_updated_time else "unknown"
     }
 
 @app.get("/page-faqs")
@@ -418,21 +486,32 @@ async def page_faqs(url: str = Query(..., description="The URL to get FAQs for")
     if url not in change_data:
         # URL not found, crawl it automatically
         try:
-            crawl_result = await crawl_and_generate_faq(url)
-            last_updated_time = crawl_result.get("last_modified")
+            crawl_result = await crawl_and_generate_faq(url, skip_faq=True)
+            last_updated_time = crawl_result.get("last_updated")
+            timestamp_source = crawl_result.get("timestamp_source")
             faq_path = crawl_result.get("faq_path")
             just_crawled = True
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to crawl URL: {str(e)}")
     else:
-        identifier = change_data[url]
-        last_updated_time = get_last_updated_from_identifier(identifier)
+        url_data = change_data[url]
+        
+        # Handle both new and legacy data formats
+        if isinstance(url_data, dict):
+            last_updated_time = url_data.get("last_updated")
+            timestamp_source = url_data.get("timestamp_source")
+        else:
+            # Legacy format
+            last_updated_time = get_last_updated_from_identifier(url_data)
+            timestamp_source = "legacy"
+        
         faq_path = find_faq_file_for_url(url)
     
     if not faq_path:
         return {
             "url": url,
             "last_updated": last_updated_time,
+            "timestamp_source": timestamp_source,
             "faqs": [],
             "message": "No FAQ file found for this URL",
             "just_crawled": just_crawled
@@ -443,10 +522,14 @@ async def page_faqs(url: str = Query(..., description="The URL to get FAQs for")
     return {
         "url": url,
         "last_updated": last_updated_time,
+        "timestamp_source": timestamp_source,
         "faqs": faqs,
         "faq_file": faq_path,
-        "just_crawled": just_crawled
+        "just_crawled": just_crawled,
+        "timestamp_reliability": "high" if last_updated_time else "unknown"
     }
+
+
 
 @app.get("/site-faqs")
 async def site_faqs(base_url: str = Query(..., description="The base URL to get all FAQs for")):

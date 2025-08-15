@@ -11,6 +11,7 @@ import json
 from typing import List
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 import dotenv
 
@@ -18,6 +19,7 @@ from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 from apify import Actor
 from markdownify import markdownify as md
 from google import genai
+from change_detection import change_detector
 
 dotenv.load_dotenv()
 
@@ -89,36 +91,49 @@ async def main() -> None:
             page = context.page
             Actor.log.info(f"Visiting {url}")
 
-            try:
-                response = await page.context.request.get(url)
-                headers = response.headers if response else {}
-            except Exception as e:
-                Actor.log.warning(f"Failed to fetch headers for {url}: {e}")
-                headers = {}
-
-            last_modified = headers.get("last-modified")
-            etag = headers.get("etag")
-
-            content = await page.content()
-            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-            identifier_parts = []
-            if last_modified:
-                identifier_parts.append(f"last_modified:{last_modified}")
-            if etag:
-                identifier_parts.append(f"etag:{etag}")
-            identifier_parts.append(f"content_hash:{content_hash}")
-            identifier = "|".join(identifier_parts)
-
-            stored_identifier = change_detection_data.get(url)
-
-            if stored_identifier == identifier:
-                Actor.log.info(f"No changes for {url}, skipping.")
-                skipped_count += 1
-                await context.enqueue_links()
-                return
+            # Check if we have stored data for conditional requests
+            stored_data = change_detection_data.get(url)
+            
+            if stored_data and isinstance(stored_data, dict):
+                # Try conditional request first
+                last_modified = stored_data.get("last_modified_header")
+                etag = stored_data.get("etag_header")
+                
+                if last_modified or etag:
+                    try:
+                        analysis = await change_detector.make_conditional_request(
+                            page, url, last_modified, etag
+                        )
+                        
+                        if analysis.get("is_not_modified"):
+                            Actor.log.info(f"Content not modified for {url} (304 response), skipping.")
+                            skipped_count += 1
+                            await context.enqueue_links()
+                            return
+                    except Exception as e:
+                        Actor.log.warning(f"Conditional request failed for {url}: {e}")
+                        # Fall back to full analysis
+            
+            # Use advanced change detection to analyze the page
+            analysis = await change_detector.analyze_page_content(page, url)
+            
+            # Check if page should be re-crawled using intelligent heuristics
+            if stored_data and isinstance(stored_data, dict):
+                if not change_detector.should_recrawl_page(url, stored_data, analysis):
+                    Actor.log.info(f"No significant changes for {url}, skipping.")
+                    skipped_count += 1
+                    await context.enqueue_links()
+                    return
+            elif stored_data:  # Legacy format
+                stored_identifier = stored_data
+                if not change_detector.has_content_changed(stored_identifier, analysis["identifier"]):
+                    Actor.log.info(f"No changes for {url}, skipping.")
+                    skipped_count += 1
+                    await context.enqueue_links()
+                    return
 
             processed_count += 1
+            content = await page.content()
             markdown_content = md(content)
 
             md_dir = os.path.join("storage", "datasets", "page_content")
@@ -145,7 +160,18 @@ async def main() -> None:
             except Exception as e:
                 Actor.log.warning(f"FAQ generation failed for {md_path}: {e}")
 
-            change_detection_data[url] = identifier
+            # Store enhanced change detection data
+            change_detection_data[url] = {
+                "identifier": analysis["identifier"],
+                "last_updated": analysis["last_updated"],
+                "timestamp_source": analysis["timestamp_source"],
+                "content_hash": analysis["content_hash"],
+                "structured_hash": analysis["structured_hash"],
+                "last_modified_header": analysis["last_modified_header"],
+                "etag_header": analysis["etag_header"],
+                "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+            
             with open(change_detection_file, 'w') as f:
                 json.dump(change_detection_data, f, indent=2)
 
