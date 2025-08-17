@@ -19,7 +19,7 @@ dotenv.load_dotenv()
 
 app = FastAPI(title="Website FAQ API", description="API for retrieving website last updated times and generating FAQs")
 
-def generate_faq_from_markdown(md_path: str, detected_language: str = "en", confidence: float = 1.0, target_language: str = None, model_name: str = "gemini-1.5-flash") -> str:
+def generate_faq_from_markdown(md_path: str, detected_language: str = "en", confidence: float = 1.0, target_language: str = None, model_name: str = "gemini-1.5-flash", script_hint: str = None) -> str:
     """Generate FAQ from markdown content using Google Gemini AI with language detection"""
     api_key = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
     if not api_key:
@@ -31,13 +31,15 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
     
     # Determine the language to use for FAQ generation
     if target_language:
-        # Use explicit target language
+        # Use explicit target language (highest priority)
         final_language = target_language
         language_instruction = f"LANGUAGE REQUIREMENT: Generate FAQs in {target_language.upper()} language. Both questions and answers must be in {target_language.upper()}."
+        print(f"Using target language override: {target_language}")
     else:
-        # Use detected language
+        # Use detected language with improved directive
         final_language = detected_language
-        language_instruction = language_detector.create_language_directive(detected_language, confidence)
+        language_instruction = language_detector.create_language_directive(detected_language, confidence, script_hint)
+        print(f"Using detected language: {detected_language} (confidence: {confidence:.2f}, script_hint: {script_hint})")
     
     prompt = (
         f"""
@@ -107,7 +109,7 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False, target_langua
             faq_path = None
             if not skip_faq:
                 try:
-                    faq_path = generate_faq_from_markdown(md_path, language_result.detected_lang, language_result.confidence, target_language)
+                    faq_path = generate_faq_from_markdown(md_path, language_result.detected_lang, language_result.confidence, target_language, script_hint=language_result.script_hint)
                 except Exception as e:
                     print(f"FAQ generation failed: {e}")
                     # Continue without FAQ generation
@@ -136,6 +138,7 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False, target_langua
                 "language_confidence": language_result.confidence,
                 "language_source": language_result.source,
                 "is_rtl": language_result.is_rtl,
+                "script_hint": language_result.script_hint,
             }
             
             with open(change_detection_file, 'w') as f:
@@ -219,7 +222,7 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50, target_langua
                         f.write(markdown_content)
                     
                     # Generate FAQ
-                    faq_path = generate_faq_from_markdown(md_path, language_result.detected_lang, language_result.confidence, target_language)
+                    faq_path = generate_faq_from_markdown(md_path, language_result.detected_lang, language_result.confidence, target_language, script_hint=language_result.script_hint)
                     
                     # Update change detection data with enhanced information
                     change_detection_data[current_url] = {
@@ -235,6 +238,7 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50, target_langua
                         "language_confidence": language_result.confidence,
                         "language_source": language_result.source,
                         "is_rtl": language_result.is_rtl,
+                        "script_hint": language_result.script_hint,
                     }
                     
                     crawled_urls.append({
@@ -474,8 +478,9 @@ async def generate_missing_faqs_for_domain(base_url: str, target_language: str =
                     url_data = change_data.get(url, {})
                     detected_lang = url_data.get("detected_language", "en")
                     confidence = url_data.get("language_confidence", 1.0)
+                    script_hint = url_data.get("script_hint")
                     
-                    generate_faq_from_markdown(md_path, detected_lang, confidence, target_language)
+                    generate_faq_from_markdown(md_path, detected_lang, confidence, target_language, script_hint=script_hint)
                     generated_count += 1
                 else:
                     # No markdown file found, need to re-crawl this specific URL
@@ -604,8 +609,9 @@ async def page_faqs(
                     # Get language info from change detection data
                     detected_lang = url_data.get("detected_language", "en")
                     confidence = url_data.get("language_confidence", 1.0)
+                    script_hint = url_data.get("script_hint")
                     
-                    faq_path = generate_faq_from_markdown(md_path, detected_lang, confidence, target_language)
+                    faq_path = generate_faq_from_markdown(md_path, detected_lang, confidence, target_language, script_hint=script_hint)
                     faq_generated = True
                 else:
                     # No markdown file found, need to re-crawl

@@ -26,7 +26,7 @@ dotenv.load_dotenv()
 
 executor = ThreadPoolExecutor()
 
-def generate_faq_from_markdown(md_path: str, detected_language: str = "en", confidence: float = 1.0, target_language: str = None, model_name: str = "gemini-1.5-flash") -> str:
+def generate_faq_from_markdown(md_path: str, detected_language: str = "en", confidence: float = 1.0, target_language: str = None, model_name: str = "gemini-1.5-flash", script_hint: str = None) -> str:
     api_key = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
     if not api_key:
         raise ValueError("GOOGLE_GENERATIVE_AI_API_KEY not found in environment variables.")
@@ -36,13 +36,15 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
     
     # Determine the language to use for FAQ generation
     if target_language:
-        # Use explicit target language
+        # Use explicit target language (highest priority)
         final_language = target_language
         language_instruction = f"LANGUAGE REQUIREMENT: Generate FAQs in {target_language.upper()} language. Both questions and answers must be in {target_language.upper()}."
+        Actor.log.info(f"Using target language override: {target_language}")
     else:
-        # Use detected language
+        # Use detected language with improved directive
         final_language = detected_language
-        language_instruction = language_detector.create_language_directive(detected_language, confidence)
+        language_instruction = language_detector.create_language_directive(detected_language, confidence, script_hint)
+        Actor.log.info(f"Using detected language: {detected_language} (confidence: {confidence:.2f}, script_hint: {script_hint})")
     
     prompt = (
         f"""
@@ -177,7 +179,7 @@ async def main() -> None:
 
             try:
                 faq_path = await asyncio.get_event_loop().run_in_executor(
-                    executor, generate_faq_from_markdown, md_path, language_result.detected_lang, language_result.confidence, target_language
+                    executor, generate_faq_from_markdown, md_path, language_result.detected_lang, language_result.confidence, target_language, language_result.script_hint
                 )
                 Actor.log.info(f"FAQ saved to {faq_path}")
             except Exception as e:
@@ -197,6 +199,7 @@ async def main() -> None:
                 "language_confidence": language_result.confidence,
                 "language_source": language_result.source,
                 "is_rtl": language_result.is_rtl,
+                "script_hint": language_result.script_hint,
             }
             
             with open(change_detection_file, 'w') as f:
