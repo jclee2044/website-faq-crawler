@@ -12,14 +12,15 @@ from markdownify import markdownify as md
 from google import genai
 import dotenv
 from change_detection import change_detector
+from language_detection import language_detector
 
 # Load environment variables
 dotenv.load_dotenv()
 
 app = FastAPI(title="Website FAQ API", description="API for retrieving website last updated times and generating FAQs")
 
-def generate_faq_from_markdown(md_path: str, model_name: str = "gemini-1.5-flash") -> str:
-    """Generate FAQ from markdown content using Google Gemini AI"""
+def generate_faq_from_markdown(md_path: str, detected_language: str = "en", confidence: float = 1.0, target_language: str = None, model_name: str = "gemini-1.5-flash") -> str:
+    """Generate FAQ from markdown content using Google Gemini AI with language detection"""
     api_key = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
     if not api_key:
         raise ValueError("GOOGLE_GENERATIVE_AI_API_KEY not found in environment variables.")
@@ -28,9 +29,20 @@ def generate_faq_from_markdown(md_path: str, model_name: str = "gemini-1.5-flash
     with open(md_path, "r", encoding="utf-8") as f:
         markdown_content = f.read()
     
+    # Determine the language to use for FAQ generation
+    if target_language:
+        # Use explicit target language
+        final_language = target_language
+        language_instruction = f"LANGUAGE REQUIREMENT: Generate FAQs in {target_language.upper()} language. Both questions and answers must be in {target_language.upper()}."
+    else:
+        # Use detected language
+        final_language = detected_language
+        language_instruction = language_detector.create_language_directive(detected_language, confidence)
+    
     prompt = (
-        """
+        f"""
         You are an expert at summarizing website content and generating helpful FAQs for users.\n
+        {language_instruction}\n
         Given the following page content in markdown, generate a concise FAQ (5-10 Q&A pairs) that covers the most important and relevant information for a user.\n
         Format the output as markdown, with each question as a bold heading and the answer as a paragraph below.\n
         Markdown content:\n\n""" + markdown_content
@@ -52,7 +64,7 @@ def generate_faq_from_markdown(md_path: str, model_name: str = "gemini-1.5-flash
     
     return faq_path
 
-async def crawl_and_generate_faq(url: str, skip_faq: bool = False) -> Dict[str, str]:
+async def crawl_and_generate_faq(url: str, skip_faq: bool = False, target_language: str = None) -> Dict[str, str]:
     """Crawl a single URL and generate FAQ for it using advanced change detection"""
     try:
         async with async_playwright() as p:
@@ -64,6 +76,11 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False) -> Dict[str, 
             
             # Use advanced change detection to analyze the page
             analysis = await change_detector.analyze_page_content(page, url)
+            
+            # Detect language from page content
+            content = await page.content()
+            language_result = language_detector.detect_language(content, url)
+            print(f"Language detected: {language_result.detected_lang} (confidence: {language_result.confidence:.2f}, source: {language_result.source})")
             
             # Convert to markdown
             content = await page.content()
@@ -90,7 +107,7 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False) -> Dict[str, 
             faq_path = None
             if not skip_faq:
                 try:
-                    faq_path = generate_faq_from_markdown(md_path)
+                    faq_path = generate_faq_from_markdown(md_path, language_result.detected_lang, language_result.confidence, target_language)
                 except Exception as e:
                     print(f"FAQ generation failed: {e}")
                     # Continue without FAQ generation
@@ -115,6 +132,10 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False) -> Dict[str, 
                 "last_modified_header": analysis["last_modified_header"],
                 "etag_header": analysis["etag_header"],
                 "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "detected_language": language_result.detected_lang,
+                "language_confidence": language_result.confidence,
+                "language_source": language_result.source,
+                "is_rtl": language_result.is_rtl,
             }
             
             with open(change_detection_file, 'w') as f:
@@ -136,7 +157,7 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False) -> Dict[str, 
     except Exception as e:
         raise Exception(f"Failed to crawl {url}: {str(e)}")
 
-async def crawl_entire_website(base_url: str, max_pages: int = 50) -> List[Dict[str, str]]:
+async def crawl_entire_website(base_url: str, max_pages: int = 50, target_language: str = None) -> List[Dict[str, str]]:
     """Crawl an entire website starting from the base URL"""
     try:
         async with async_playwright() as p:
@@ -172,6 +193,11 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50) -> List[Dict[
                     # Use advanced change detection to analyze the page
                     analysis = await change_detector.analyze_page_content(page, current_url)
                     
+                    # Detect language from page content
+                    content = await page.content()
+                    language_result = language_detector.detect_language(content, current_url)
+                    print(f"Language detected for {current_url}: {language_result.detected_lang} (confidence: {language_result.confidence:.2f}, source: {language_result.source})")
+                    
                     # Convert to markdown
                     markdown_content = md(content)
                     
@@ -193,7 +219,7 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50) -> List[Dict[
                         f.write(markdown_content)
                     
                     # Generate FAQ
-                    faq_path = generate_faq_from_markdown(md_path)
+                    faq_path = generate_faq_from_markdown(md_path, language_result.detected_lang, language_result.confidence, target_language)
                     
                     # Update change detection data with enhanced information
                     change_detection_data[current_url] = {
@@ -205,6 +231,10 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50) -> List[Dict[
                         "last_modified_header": analysis["last_modified_header"],
                         "etag_header": analysis["etag_header"],
                         "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "detected_language": language_result.detected_lang,
+                        "language_confidence": language_result.confidence,
+                        "language_source": language_result.source,
+                        "is_rtl": language_result.is_rtl,
                     }
                     
                     crawled_urls.append({
@@ -414,6 +444,49 @@ def get_all_faqs_for_domain(base_url: str) -> List[Dict[str, str]]:
     
     return all_faqs
 
+async def generate_missing_faqs_for_domain(base_url: str, target_language: str = None) -> int:
+    """Generate missing FAQs for all crawled URLs in a domain"""
+    change_data = get_change_detection_data()
+    domain = urlparse(base_url).netloc
+    crawled_urls = [url for url in change_data.keys() if urlparse(url).netloc == domain]
+    
+    generated_count = 0
+    
+    for url in crawled_urls:
+        # Check if FAQ exists for this URL
+        faq_path = find_faq_file_for_url(url)
+        
+        if not faq_path:
+            try:
+                # Find the markdown file for this URL
+                parsed_url = urlparse(url)
+                path_parts = [part for part in parsed_url.path.strip('/').split('/') if part]
+                base_name = '_'.join(filter(None, [
+                    ''.join(c if c.isalnum() or c in '-_' else '_' for c in (path_parts[-1] if path_parts else 'index'))
+                ])) or 'index'
+                domain_prefix = parsed_url.netloc.replace('www.', '').split('.')[0]
+                md_filename = f"{domain_prefix}_{base_name}.md"
+                md_dir = os.path.join("storage", "datasets", "page_content")
+                md_path = os.path.join(md_dir, md_filename[:255])
+                
+                if os.path.exists(md_path):
+                    # Get language info from change detection data
+                    url_data = change_data.get(url, {})
+                    detected_lang = url_data.get("detected_language", "en")
+                    confidence = url_data.get("language_confidence", 1.0)
+                    
+                    generate_faq_from_markdown(md_path, detected_lang, confidence, target_language)
+                    generated_count += 1
+                else:
+                    # No markdown file found, need to re-crawl this specific URL
+                    await crawl_and_generate_faq(url, skip_faq=False, target_language=target_language)
+                    generated_count += 1
+            except Exception as e:
+                print(f"Failed to generate FAQ for {url}: {e}")
+                continue
+    
+    return generated_count
+
 @app.get("/last-updated")
 async def last_updated(
     url: str = Query(..., description="The URL to check for last updated time"),
@@ -473,24 +546,30 @@ async def last_updated(
     }
 
 @app.get("/page-faqs")
-async def page_faqs(url: str = Query(..., description="The URL to get FAQs for")):
+async def page_faqs(
+    url: str = Query(..., description="The URL to get FAQs for"),
+    target_language: str = Query(None, description="Optional target language for FAQ generation (ISO code, e.g., 'es', 'fr')")
+):
     """
     Get the last updated time and FAQs for a specific page.
     
     If the URL hasn't been crawled yet, it will be crawled automatically and FAQs will be generated.
+    If the URL has been crawled but no FAQ exists, it will generate the FAQ on the spot.
     Returns both the last updated timestamp and the generated FAQs for the page.
     """
     change_data = get_change_detection_data()
     just_crawled = False
+    faq_generated = False
     
     if url not in change_data:
         # URL not found, crawl it automatically
         try:
-            crawl_result = await crawl_and_generate_faq(url, skip_faq=True)
+            crawl_result = await crawl_and_generate_faq(url, skip_faq=False, target_language=target_language)  # Generate FAQ
             last_updated_time = crawl_result.get("last_updated")
             timestamp_source = crawl_result.get("timestamp_source")
             faq_path = crawl_result.get("faq_path")
             just_crawled = True
+            faq_generated = True
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to crawl URL: {str(e)}")
     else:
@@ -506,6 +585,38 @@ async def page_faqs(url: str = Query(..., description="The URL to get FAQs for")
             timestamp_source = "legacy"
         
         faq_path = find_faq_file_for_url(url)
+        
+        # If FAQ doesn't exist but we have page data, generate it on the spot
+        if not faq_path:
+            try:
+                # Find the markdown file for this URL
+                parsed_url = urlparse(url)
+                path_parts = [part for part in parsed_url.path.strip('/').split('/') if part]
+                base_name = '_'.join(filter(None, [
+                    ''.join(c if c.isalnum() or c in '-_' else '_' for c in (path_parts[-1] if path_parts else 'index'))
+                ])) or 'index'
+                domain_prefix = parsed_url.netloc.replace('www.', '').split('.')[0]
+                md_filename = f"{domain_prefix}_{base_name}.md"
+                md_dir = os.path.join("storage", "datasets", "page_content")
+                md_path = os.path.join(md_dir, md_filename[:255])
+                
+                if os.path.exists(md_path):
+                    # Get language info from change detection data
+                    detected_lang = url_data.get("detected_language", "en")
+                    confidence = url_data.get("language_confidence", 1.0)
+                    
+                    faq_path = generate_faq_from_markdown(md_path, detected_lang, confidence, target_language)
+                    faq_generated = True
+                else:
+                    # No markdown file found, need to re-crawl
+                    crawl_result = await crawl_and_generate_faq(url, skip_faq=False, target_language=target_language)
+                    last_updated_time = crawl_result.get("last_updated")
+                    timestamp_source = crawl_result.get("timestamp_source")
+                    faq_path = crawl_result.get("faq_path")
+                    just_crawled = True
+                    faq_generated = True
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to generate FAQ: {str(e)}")
     
     if not faq_path:
         return {
@@ -513,8 +624,9 @@ async def page_faqs(url: str = Query(..., description="The URL to get FAQs for")
             "last_updated": last_updated_time,
             "timestamp_source": timestamp_source,
             "faqs": [],
-            "message": "No FAQ file found for this URL",
-            "just_crawled": just_crawled
+            "message": "No FAQ file found for this URL and could not generate one",
+            "just_crawled": just_crawled,
+            "faq_generated": faq_generated
         }
     
     faqs = read_faq_content(faq_path)
@@ -526,34 +638,47 @@ async def page_faqs(url: str = Query(..., description="The URL to get FAQs for")
         "faqs": faqs,
         "faq_file": faq_path,
         "just_crawled": just_crawled,
+        "faq_generated": faq_generated,
         "timestamp_reliability": "high" if last_updated_time else "unknown"
     }
 
 
 
 @app.get("/site-faqs")
-async def site_faqs(base_url: str = Query(..., description="The base URL to get all FAQs for")):
+async def site_faqs(
+    base_url: str = Query(..., description="The base URL to get all FAQs for"),
+    target_language: str = Query(None, description="Optional target language for FAQ generation (ISO code, e.g., 'es', 'fr')")
+):
     """
     Get all FAQs for an entire website.
     
     If the base URL hasn't been crawled yet, it will be crawled automatically.
+    If the base URL has been crawled but some FAQs are missing, they will be generated on the spot.
     Returns all generated FAQs across all pages of the website.
     """
     # Validate that the base URL has been crawled
     change_data = get_change_detection_data()
     crawled_urls = [url for url in change_data.keys() if urlparse(url).netloc == urlparse(base_url).netloc]
     just_crawled = False
+    faqs_generated = 0
     
     if not crawled_urls:
         # Domain not found, crawl the entire website automatically
         try:
-            crawl_results = await crawl_entire_website(base_url)
+            crawl_results = await crawl_entire_website(base_url, target_language=target_language)
             just_crawled = True
             # Refresh the data after crawling
             change_data = get_change_detection_data()
             crawled_urls = [url for url in change_data.keys() if urlparse(url).netloc == urlparse(base_url).netloc]
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to crawl website: {str(e)}")
+    else:
+        # Domain has been crawled, but check for missing FAQs
+        try:
+            faqs_generated = await generate_missing_faqs_for_domain(base_url, target_language=target_language)
+        except Exception as e:
+            # Log the error but continue - we'll still return existing FAQs
+            print(f"Warning: Failed to generate missing FAQs: {e}")
     
     all_faqs = get_all_faqs_for_domain(base_url)
     
@@ -563,6 +688,7 @@ async def site_faqs(base_url: str = Query(..., description="The base URL to get 
         "crawled_pages": len(crawled_urls),
         "faqs": all_faqs,
         "just_crawled": just_crawled,
+        "faqs_generated": faqs_generated,
         "crawled_urls": crawled_urls
     }
 

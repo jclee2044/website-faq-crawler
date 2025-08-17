@@ -7,14 +7,24 @@ This project combines a web crawler that generates FAQs from website content wit
 ### Crawler (`crawler.py`)
 - Crawls websites using Playwright
 - Converts HTML content to Markdown
-- Generates FAQs using Google's Gemini AI
+- **Automatic language detection** with metadata hints and content analysis
+- Generates FAQs using Google's Gemini AI in the detected language
 - Implements change detection to avoid re-processing unchanged pages
 - Stores data in organized file structure
+
+### Language Detection (`language_detection.py`)
+- **Centralized language detection** with multiple detection methods
+- Extracts metadata hints (`<html lang>`, `og:locale`, etc.)
+- Uses robust detectors (pycld3 with langdetect fallback)
+- Normalizes to ISO-639-1 codes with confidence scores
+- Supports RTL languages (Arabic, Hebrew, etc.)
+- Creates language directives for LLM prompts
 
 ### API Server (`main.py`)
 - **`/last-updated`** - Get last updated time for a specific URL (auto-crawls if not found)
 - **`/page-faqs`** - Get FAQs for a specific page (auto-crawls and generates FAQs if not found)
 - **`/site-faqs`** - Get all FAQs for an entire website (auto-crawls base URL if domain not found)
+- **Optional target language support** - Override detected language for FAQ generation
 
 ## Setup
 
@@ -22,6 +32,8 @@ This project combines a web crawler that generates FAQs from website content wit
 ```bash
 pip install -r requirements.txt
 ```
+
+**Note**: The language detection system uses `pycld3` (primary) and `langdetect` (fallback). If `pycld3` fails to install, the system will automatically fall back to `langdetect`.
 
 ### 2. Set up Environment Variables
 Create a `.env` file with your Google AI API key:
@@ -76,6 +88,11 @@ Response:
 curl "http://localhost:8000/page-faqs?url=https://www.inhotel.io/"
 ```
 
+**With target language override:**
+```bash
+curl "http://localhost:8000/page-faqs?url=https://www.inhotel.io/&target_language=es"
+```
+
 Response:
 ```json
 {
@@ -96,11 +113,16 @@ Response:
 }
 ```
 
-**Note**: If the URL hasn't been crawled before, the API will automatically crawl it, generate FAQs, and return `"just_crawled": true`.
+**Note**: If the URL hasn't been crawled before, the API will automatically crawl it, generate FAQs, and return `"just_crawled": true`. Use `target_language` parameter to override the detected language.
 
 ### 3. Get All Site FAQs
 ```bash
 curl "http://localhost:8000/site-faqs?base_url=https://www.inhotel.io/"
+```
+
+**With target language override:**
+```bash
+curl "http://localhost:8000/site-faqs?base_url=https://www.inhotel.io/&target_language=fr"
 ```
 
 Response:
@@ -130,7 +152,7 @@ Response:
 }
 ```
 
-**Note**: If the domain hasn't been crawled before, the API will automatically crawl the entire website (up to 50 pages) and return `"just_crawled": true`.
+**Note**: If the domain hasn't been crawled before, the API will automatically crawl the entire website (up to 50 pages) and return `"just_crawled": true`. Use `target_language` parameter to override the detected language.
 
 
 
@@ -142,17 +164,20 @@ Once the server is running, visit `http://localhost:8000/docs` for interactive A
 
 ```
 .
-├── main.py              # FastAPI server
-├── crawler.py           # Web crawler
-├── run_server.py        # Server startup script
-├── requirements.txt     # Python dependencies
-├── README.md           # This file
-├── .env                # Environment variables (create this)
-└── storage/            # Crawler data storage
+├── main.py                    # FastAPI server
+├── crawler.py                 # Web crawler
+├── language_detection.py      # Language detection system
+├── change_detection.py        # Change detection system
+
+├── run_server.py              # Server startup script
+├── requirements.txt           # Python dependencies
+├── README.md                 # This file
+├── .env                      # Environment variables (create this)
+└── storage/                  # Crawler data storage
     ├── change_detection.json
     └── datasets/
-        ├── page_content/    # Markdown versions of pages
-        └── faqs/           # Generated FAQ files
+        ├── page_content/      # Markdown versions of pages
+        └── faqs/             # Generated FAQ files
 ```
 
 ## Customization
@@ -163,8 +188,24 @@ Edit `crawler.py` and modify the `start_urls` list in the `main()` function.
 ### Adjust FAQ Generation
 Modify the prompt in the `generate_faq_from_markdown()` function in `crawler.py`.
 
+### Language Detection
+The language detection system automatically:
+- Extracts metadata hints from HTML
+- Uses content analysis as fallback
+- Normalizes language codes to ISO-639-1
+- Creates appropriate language directives for the LLM
+- Supports optional target language override
+
+### Target Language Override
+You can override the detected language for FAQ generation:
+- **API endpoints**: Use `target_language` parameter (e.g., `?target_language=es`)
+- **Crawler**: Pass `target_language` in actor input
+- **Fallback**: If no target language specified, uses auto-detection
+
 ### Change API Port
 Edit the port in `main.py` or `run_server.py`.
+
+
 
 ## Error Handling
 

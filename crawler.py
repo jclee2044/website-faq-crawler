@@ -20,21 +20,34 @@ from apify import Actor
 from markdownify import markdownify as md
 from google import genai
 from change_detection import change_detector
+from language_detection import language_detector
 
 dotenv.load_dotenv()
 
 executor = ThreadPoolExecutor()
 
-def generate_faq_from_markdown(md_path: str, model_name: str = "gemini-1.5-flash") -> str:
+def generate_faq_from_markdown(md_path: str, detected_language: str = "en", confidence: float = 1.0, target_language: str = None, model_name: str = "gemini-1.5-flash") -> str:
     api_key = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
     if not api_key:
         raise ValueError("GOOGLE_GENERATIVE_AI_API_KEY not found in environment variables.")
     client = genai.Client(api_key=api_key)
     with open(md_path, "r", encoding="utf-8") as f:
         markdown_content = f.read()
+    
+    # Determine the language to use for FAQ generation
+    if target_language:
+        # Use explicit target language
+        final_language = target_language
+        language_instruction = f"LANGUAGE REQUIREMENT: Generate FAQs in {target_language.upper()} language. Both questions and answers must be in {target_language.upper()}."
+    else:
+        # Use detected language
+        final_language = detected_language
+        language_instruction = language_detector.create_language_directive(detected_language, confidence)
+    
     prompt = (
-        """
+        f"""
         You are an expert at summarizing website content and generating helpful FAQs for users.\n
+        {language_instruction}\n
         Given the following page content in markdown, generate a concise FAQ (5-10 Q&A pairs) that covers the most important and relevant information for a user.\n
         Format the output as markdown, with each question as a bold heading and the answer as a paragraph below.\n
         Markdown content:\n\n""" + markdown_content
@@ -58,6 +71,11 @@ async def main() -> None:
         start_urls: List[str] = [
             url.get("url") for url in actor_input.get("start_urls", [{"url": "https://www.inhotel.io/"}])
         ]
+        
+        # Get optional target language for FAQ generation
+        target_language = actor_input.get("target_language")
+        if target_language:
+            Actor.log.info(f"Target language for FAQ generation: {target_language}")
 
         if not start_urls:
             Actor.log.info("No start URLs provided, exiting.")
@@ -117,6 +135,11 @@ async def main() -> None:
             # Use advanced change detection to analyze the page
             analysis = await change_detector.analyze_page_content(page, url)
             
+            # Detect language from page content
+            content = await page.content()
+            language_result = language_detector.detect_language(content, url)
+            Actor.log.info(f"Language detected: {language_result.detected_lang} (confidence: {language_result.confidence:.2f}, source: {language_result.source})")
+            
             # Check if page should be re-crawled using intelligent heuristics
             if stored_data and isinstance(stored_data, dict):
                 if not change_detector.should_recrawl_page(url, stored_data, analysis):
@@ -154,7 +177,7 @@ async def main() -> None:
 
             try:
                 faq_path = await asyncio.get_event_loop().run_in_executor(
-                    executor, generate_faq_from_markdown, md_path
+                    executor, generate_faq_from_markdown, md_path, language_result.detected_lang, language_result.confidence, target_language
                 )
                 Actor.log.info(f"FAQ saved to {faq_path}")
             except Exception as e:
@@ -170,6 +193,10 @@ async def main() -> None:
                 "last_modified_header": analysis["last_modified_header"],
                 "etag_header": analysis["etag_header"],
                 "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "detected_language": language_result.detected_lang,
+                "language_confidence": language_result.confidence,
+                "language_source": language_result.source,
+                "is_rtl": language_result.is_rtl,
             }
             
             with open(change_detection_file, 'w') as f:
