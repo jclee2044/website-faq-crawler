@@ -3,9 +3,10 @@ import json
 import glob
 import asyncio
 import hashlib
+import time
 from datetime import datetime
 from typing import List, Dict, Optional, Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from fastapi import FastAPI, Query, HTTPException
 from playwright.async_api import async_playwright
 from markdownify import markdownify as md
@@ -13,6 +14,7 @@ from google import genai
 import dotenv
 from change_detection import change_detector
 from language_detection import language_detector
+from url_filters import same_domain, strip_query, is_media, is_blocked
 
 # Load environment variables
 dotenv.load_dotenv()
@@ -28,6 +30,19 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
     client = genai.Client(api_key=api_key)
     with open(md_path, "r", encoding="utf-8") as f:
         markdown_content = f.read()
+    
+    # Extract title and URL from the markdown header written during crawl
+    title = None
+    page_url = None
+    for line in markdown_content.splitlines():
+        if not title and line.startswith("# "):
+            title = line[2:].strip()
+        elif not page_url and line.startswith("**URL:**"):
+            page_url = line.replace("**URL:**", "").strip()
+        if title and page_url:
+            break
+    if not title:
+        title = "FAQ"
     
     # Determine the language to use for FAQ generation
     if target_language:
@@ -56,28 +71,100 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
     )
     
     faq_md = response.text
+
+    # Prepend the original page title and URL to the saved FAQ file for reliable source mapping
+    header_lines = f"# {title}\n\n"
+    if page_url:
+        header_lines += f"**URL:** {page_url}\n\n"
+    faq_output = header_lines + faq_md
+    
     faq_dir = os.path.join("storage", "datasets", "faqs")
     os.makedirs(faq_dir, exist_ok=True)
     base_name = os.path.basename(md_path).replace(".md", "_faq.md")
     faq_path = os.path.join(faq_dir, base_name)
     
     with open(faq_path, "w", encoding="utf-8") as f:
-        f.write(faq_md)
+        f.write(faq_output)
     
     return faq_path
 
 async def crawl_and_generate_faq(url: str, skip_faq: bool = False, target_language: str = None) -> Dict[str, str]:
     """Crawl a single URL and generate FAQ for it using advanced change detection"""
     try:
+        # Upfront URL filtering
+        parsed_for_filter = urlparse(url)
+        base_netloc = parsed_for_filter.netloc
+        if is_media(url) or is_blocked(url, base_netloc):
+            print(f"Skip filtered URL: {url}")
+            existing_faq = find_faq_file_for_url(url)
+            # Return quickly without crawling
+            return {
+                "url": url,
+                "last_updated": None,
+                "timestamp_source": None,
+                "md_path": None,
+                "faq_path": existing_faq,
+                "identifier": None,
+                "content_hash": None,
+                "structured_hash": None,
+            }
+        
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=["--disable-gpu"])
             page = await browser.new_page()
             
-            # Navigate to the page
-            await page.goto(url, wait_until="networkidle")
+            # Block non-essential resources
+            async def route_handler(route):
+                req = route.request
+                u = req.url
+                rtype = req.resource_type
+                if rtype in ("image", "media", "font", "stylesheet") or is_media(u) or is_blocked(u, base_netloc):
+                    await route.abort()
+                    return
+                if rtype in ("xhr", "fetch") and not same_domain(u, url):
+                    await route.abort()
+                    return
+                await route.continue_()
+            try:
+                await page.route("**/*", route_handler)
+            except Exception:
+                pass
             
-            # Use advanced change detection to analyze the page
-            analysis = await change_detector.analyze_page_content(page, url)
+            # Load stored data for lightweight check
+            change_detection_file = os.path.join("storage", "change_detection.json")
+            try:
+                with open(change_detection_file, 'r') as f:
+                    stored_all = json.load(f)
+                    stored_data = stored_all.get(url, {}) if isinstance(stored_all, dict) else {}
+            except Exception:
+                stored_data = {}
+
+            # If existing FAQ and headers unchanged, skip full crawl
+            existing_faq = find_faq_file_for_url(url)
+            if existing_faq and isinstance(stored_data, dict) and (stored_data.get("last_modified_header") or stored_data.get("etag_header")):
+                try:
+                    lw = await change_detector.check_page_changes_lightweight(page, url, stored_data)
+                    if not lw.get("needs_deep_check", True):
+                        print(f"Headers unchanged for {url}, using existing FAQ")
+                        await browser.close()
+                        return {
+                            "url": url,
+                            "last_updated": stored_data.get("last_updated"),
+                            "timestamp_source": stored_data.get("timestamp_source"),
+                            "md_path": None,
+                            "faq_path": existing_faq,
+                            "identifier": stored_data.get("identifier"),
+                            "content_hash": stored_data.get("content_hash"),
+                            "structured_hash": stored_data.get("structured_hash"),
+                        }
+                except Exception:
+                    pass
+            
+            # Navigate to the page (faster)
+            await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+            
+            # Use efficient change detection
+            analysis = await change_detector.analyze_page_efficient(page, url, stored_data if isinstance(stored_data, dict) else None)
             
             # Detect language from page content
             content = await page.content()
@@ -85,7 +172,6 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False, target_langua
             print(f"Language detected: {language_result.detected_lang} (confidence: {language_result.confidence:.2f}, source: {language_result.source})")
             
             # Convert to markdown
-            content = await page.content()
             markdown_content = md(content)
             
             # Save markdown content
@@ -115,7 +201,6 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False, target_langua
                     # Continue without FAQ generation
             
             # Update change detection data with enhanced information
-            change_detection_file = os.path.join("storage", "change_detection.json")
             os.makedirs(os.path.dirname(change_detection_file), exist_ok=True)
             
             try:
@@ -131,8 +216,8 @@ async def crawl_and_generate_faq(url: str, skip_faq: bool = False, target_langua
                 "timestamp_source": analysis["timestamp_source"],
                 "content_hash": analysis["content_hash"],
                 "structured_hash": analysis["structured_hash"],
-                "last_modified_header": analysis["last_modified_header"],
-                "etag_header": analysis["etag_header"],
+                "last_modified_header": analysis.get("last_modified_header"),
+                "etag_header": analysis.get("etag_header"),
                 "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "detected_language": language_result.detected_lang,
                 "language_confidence": language_result.confidence,
@@ -168,6 +253,24 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50, target_langua
             context = await browser.new_context()
             page = await context.new_page()
             
+            # Block non-essential resources
+            base_netloc = urlparse(base_url).netloc
+            async def route_handler(route):
+                req = route.request
+                u = req.url
+                rtype = req.resource_type
+                if rtype in ("image", "media", "font", "stylesheet") or is_media(u) or is_blocked(u, base_netloc):
+                    await route.abort()
+                    return
+                if rtype in ("xhr", "fetch") and not same_domain(u, base_url):
+                    await route.abort()
+                    return
+                await route.continue_()
+            try:
+                await page.route("**/*", route_handler)
+            except Exception:
+                pass
+            
             # Set up storage for change detection
             change_detection_file = os.path.join("storage", "change_detection.json")
             os.makedirs(os.path.dirname(change_detection_file), exist_ok=True)
@@ -179,22 +282,54 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50, target_langua
                 change_detection_data = {}
             
             crawled_urls = []
-            urls_to_crawl = [base_url]
+            urls_to_crawl: List[tuple[str, int]] = [(base_url, 0)]
+            seen_normalized = set([strip_query(base_url)])
             crawled_count = 0
             
             while urls_to_crawl and crawled_count < max_pages:
-                current_url = urls_to_crawl.pop(0)
+                current_url, depth = urls_to_crawl.pop(0)
                 
-                # Skip if already crawled
-                if current_url in change_detection_data:
+                # Upfront URL filtering
+                if is_media(current_url) or is_blocked(current_url, base_netloc):
+                    print(f"Skip filtered URL: {current_url}")
                     continue
                 
+                # Skip if already crawled and unchanged (lightweight)
                 try:
-                    # Navigate to the page
-                    await page.goto(current_url, wait_until="networkidle", timeout=30000)
+                    old_data = change_detection_data.get(current_url) if isinstance(change_detection_data, dict) else None
+                    existing_faq = find_faq_file_for_url(current_url)
+                    if existing_faq and isinstance(old_data, dict) and (old_data.get("last_modified_header") or old_data.get("etag_header")):
+                        lw = await change_detector.check_page_changes_lightweight(page, current_url, old_data)
+                        if not lw.get("needs_deep_check", True):
+                            # Unchanged: use existing FAQ and skip deep crawl
+                            crawled_urls.append({
+                                "url": current_url,
+                                "last_updated": old_data.get("last_updated"),
+                                "timestamp_source": old_data.get("timestamp_source"),
+                                "md_path": None,
+                                "faq_path": existing_faq,
+                                "identifier": old_data.get("identifier"),
+                                "content_hash": old_data.get("content_hash"),
+                                "structured_hash": old_data.get("structured_hash"),
+                            })
+                            crawled_count += 1
+                            # Do not enqueue links from this page (no navigation)
+                            continue
+                except Exception:
+                    pass
+                
+                # Skip if already crawled (no FAQ or changed detection will proceed)
+                if current_url in change_detection_data:
+                    # We still may need to generate missing FAQ; handle via backfill later
+                    pass
+                
+                try:
+                    # Navigate to the page (faster)
+                    await page.goto(current_url, wait_until="domcontentloaded", timeout=10000)
                     
-                    # Use advanced change detection to analyze the page
-                    analysis = await change_detector.analyze_page_content(page, current_url)
+                    # Use efficient change detection
+                    old_data = change_detection_data.get(current_url) if isinstance(change_detection_data, dict) else None
+                    analysis = await change_detector.analyze_page_efficient(page, current_url, old_data if isinstance(old_data, dict) else None)
                     
                     # Detect language from page content
                     content = await page.content()
@@ -231,8 +366,8 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50, target_langua
                         "timestamp_source": analysis["timestamp_source"],
                         "content_hash": analysis["content_hash"],
                         "structured_hash": analysis["structured_hash"],
-                        "last_modified_header": analysis["last_modified_header"],
-                        "etag_header": analysis["etag_header"],
+                        "last_modified_header": analysis.get("last_modified_header"),
+                        "etag_header": analysis.get("etag_header"),
                         "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
                         "detected_language": language_result.detected_lang,
                         "language_confidence": language_result.confidence,
@@ -254,26 +389,44 @@ async def crawl_entire_website(base_url: str, max_pages: int = 50, target_langua
                     
                     crawled_count += 1
                     
-                    # Find links to crawl (same domain only)
-                    links = await page.query_selector_all("a[href]")
-                    base_domain = urlparse(base_url).netloc
-                    
-                    for link in links:
-                        href = await link.get_attribute("href")
-                        if href:
-                            # Resolve relative URLs
+                    # Find links to crawl (same domain only), depth cap 2, dedupe, strip query, cap total
+                    if depth < 2 and crawled_count < max_pages:
+                        links = await page.query_selector_all("a[href]")
+                        base_domain = urlparse(base_url).netloc
+                        for link in links:
+                            href = await link.get_attribute("href")
+                            if not href:
+                                continue
+                            if href.startswith('#') or href.startswith('mailto:') or href.startswith('tel:'):
+                                continue
                             if href.startswith('/'):
                                 full_url = f"{urlparse(base_url).scheme}://{base_domain}{href}"
                             elif href.startswith('http'):
                                 full_url = href
                             else:
+                                # Resolve relative URLs
+                                full_url = urljoin(current_url, href)
+                            # Only crawl same-domain http(s)
+                            parsed = urlparse(full_url)
+                            if parsed.scheme not in ("http", "https"):
+                                print(f"Skip non-http(s): {full_url}")
                                 continue
-                            
-                            # Only crawl same domain
-                            if urlparse(full_url).netloc == base_domain:
-                                if full_url not in change_detection_data and full_url not in urls_to_crawl:
-                                    urls_to_crawl.append(full_url)
-                    
+                            if not same_domain(full_url, base_url):
+                                print(f"Skip off-domain: {full_url}")
+                                continue
+                            if is_media(full_url):
+                                print(f"Skip media: {full_url}")
+                                continue
+                            if is_blocked(full_url, base_domain):
+                                print(f"Skip blocked: {full_url}")
+                                continue
+                            normalized = strip_query(full_url)
+                            if normalized in seen_normalized or normalized in change_detection_data:
+                                continue
+                            seen_normalized.add(normalized)
+                            if len(seen_normalized) <= max_pages:
+                                urls_to_crawl.append((normalized, depth + 1))
+                
                 except Exception as e:
                     print(f"Failed to crawl {current_url}: {str(e)}")
                     continue
@@ -457,6 +610,11 @@ async def generate_missing_faqs_for_domain(base_url: str, target_language: str =
     generated_count = 0
     
     for url in crawled_urls:
+        # Skip filtered URLs entirely
+        if is_media(url) or is_blocked(url, domain):
+            print(f"Skip filtered URL (backfill): {url}")
+            continue
+        
         # Check if FAQ exists for this URL
         faq_path = find_faq_file_for_url(url)
         
@@ -653,49 +811,58 @@ async def page_faqs(
 @app.get("/site-faqs")
 async def site_faqs(
     base_url: str = Query(..., description="The base URL to get all FAQs for"),
-    target_language: str = Query(None, description="Optional target language for FAQ generation (ISO code, e.g., 'es', 'fr')")
+    target_language: str = Query(None, description="Optional target language for FAQ generation (ISO code, e.g., 'es', 'fr')"),
+    max_pages: int = Query(50, description="Maximum number of pages to crawl for this domain"),
+    force_recrawl: bool = Query(False, description="Force re-crawl before generating FAQs")
 ):
     """
-    Get all FAQs for an entire website.
-    
-    If the base URL hasn't been crawled yet, it will be crawled automatically.
-    If the base URL has been crawled but some FAQs are missing, they will be generated on the spot.
-    Returns all generated FAQs across all pages of the website.
+    Generate and return complete FAQs for an entire website in a single call.
+
+    - If force_recrawl is true or the domain has no entries, perform a full crawl first.
+    - Always backfill any missing FAQ files for already-crawled pages.
+    - Return the combined set of FAQs for the domain.
     """
-    # Validate that the base URL has been crawled
+    start_time = time.perf_counter()
+    domain_netloc = urlparse(base_url).netloc
+
+    # Load current change detection data
     change_data = get_change_detection_data()
-    crawled_urls = [url for url in change_data.keys() if urlparse(url).netloc == urlparse(base_url).netloc]
-    just_crawled = False
-    faqs_generated = 0
-    
-    if not crawled_urls:
-        # Domain not found, crawl the entire website automatically
+    domain_urls = [u for u in change_data.keys() if urlparse(u).netloc == domain_netloc]
+
+    crawled_pages_count = 0
+
+    # Crawl if requested or if domain is unseen
+    if force_recrawl or not domain_urls:
         try:
-            crawl_results = await crawl_entire_website(base_url, target_language=target_language)
-            just_crawled = True
-            # Refresh the data after crawling
+            crawl_results = await crawl_entire_website(base_url, max_pages=max_pages, target_language=target_language)
+            crawled_pages_count = len(crawl_results)
+            # Refresh after crawl
             change_data = get_change_detection_data()
-            crawled_urls = [url for url in change_data.keys() if urlparse(url).netloc == urlparse(base_url).netloc]
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to crawl website: {str(e)}")
-    else:
-        # Domain has been crawled, but check for missing FAQs
-        try:
-            faqs_generated = await generate_missing_faqs_for_domain(base_url, target_language=target_language)
-        except Exception as e:
-            # Log the error but continue - we'll still return existing FAQs
-            print(f"Warning: Failed to generate missing FAQs: {e}")
-    
+
+    # Always backfill any missing FAQs for already-crawled pages
+    try:
+        backfilled_count = await generate_missing_faqs_for_domain(base_url, target_language=target_language)
+    except Exception as e:
+        print(f"Warning: Failed to generate missing FAQs: {e}")
+        backfilled_count = 0
+
+    # Gather all FAQs for the domain
     all_faqs = get_all_faqs_for_domain(base_url)
-    
+
+    # Total pages known for this domain after any crawl backfill
+    change_data = get_change_detection_data()
+    total_pages = len([u for u in change_data.keys() if urlparse(u).netloc == domain_netloc])
+
+    elapsed_s = time.perf_counter() - start_time
+    print(f"[site-faqs] domain={domain_netloc} crawled_pages={crawled_pages_count} backfilled_faqs={backfilled_count} elapsed={elapsed_s:.2f}s")
+
     return {
-        "base_url": base_url,
-        "total_faqs": len(all_faqs),
-        "crawled_pages": len(crawled_urls),
+        "domain": domain_netloc,
+        "generated_now": backfilled_count,
+        "total_pages": total_pages,
         "faqs": all_faqs,
-        "just_crawled": just_crawled,
-        "faqs_generated": faqs_generated,
-        "crawled_urls": crawled_urls
     }
 
 

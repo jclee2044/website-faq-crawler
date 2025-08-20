@@ -10,6 +10,8 @@ from playwright.async_api import Page
 import logging
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin
+from playwright.async_api import async_playwright
+
 
 logger = logging.getLogger(__name__)
 

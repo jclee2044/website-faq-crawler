@@ -107,18 +107,9 @@ class LanguageDetector:
     
     def _init_detectors(self):
         """Initialize language detection libraries with fallbacks"""
-        self.pycld3_available = False
         self.langdetect_available = False
         
-        # Try pycld3 first (more accurate)
-        try:
-            import pycld3
-            self.pycld3_available = True
-            logger.info("pycld3 language detector initialized")
-        except ImportError:
-            logger.warning("pycld3 not available, falling back to langdetect")
-        
-        # Try langdetect as fallback
+        # Try langdetect
         try:
             import langdetect
             self.langdetect_available = True
@@ -259,18 +250,7 @@ class LanguageDetector:
         # Clean text for better detection
         cleaned_text = self._clean_text_for_detection(text)
         
-        # Try pycld3 first (more accurate)
-        if self.pycld3_available:
-            try:
-                import pycld3
-                result = pycld3.get_language(cleaned_text)
-                if result and result.is_reliable:
-                    lang_code = self.normalize_language_code(result.language)
-                    return lang_code, result.probability, 'pycld3'
-            except Exception as e:
-                logger.warning(f"pycld3 detection failed: {e}")
-        
-        # Fallback to langdetect with improved confidence calculation
+        # Try langdetect
         if self.langdetect_available:
             try:
                 import langdetect

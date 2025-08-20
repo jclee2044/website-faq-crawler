@@ -8,8 +8,8 @@ os.environ['PURGE_ON_START'] = '0'
 import asyncio
 import hashlib
 import json
-from typing import List
-from urllib.parse import urlparse
+from typing import List, Set
+from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -21,6 +21,7 @@ from markdownify import markdownify as md
 from google import genai
 from change_detection import change_detector
 from language_detection import language_detector
+from url_filters import same_domain, strip_query, is_media, is_blocked
 
 dotenv.load_dotenv()
 
@@ -33,6 +34,19 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
     client = genai.Client(api_key=api_key)
     with open(md_path, "r", encoding="utf-8") as f:
         markdown_content = f.read()
+
+    # Extract title and URL from header
+    title = None
+    page_url = None
+    for line in markdown_content.splitlines():
+        if not title and line.startswith("# "):
+            title = line[2:].strip()
+        elif not page_url and line.startswith("**URL:**"):
+            page_url = line.replace("**URL:**", "").strip()
+        if title and page_url:
+            break
+    if not title:
+        title = "FAQ"
     
     # Determine the language to use for FAQ generation
     if target_language:
@@ -59,12 +73,19 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
         contents=prompt
     )
     faq_md = response.text
+
+    # Prepend original title and URL
+    header_lines = f"# {title}\n\n"
+    if page_url:
+        header_lines += f"**URL:** {page_url}\n\n"
+    faq_output = header_lines + faq_md
+
     faq_dir = os.path.join("storage", "datasets", "faqs")
     os.makedirs(faq_dir, exist_ok=True)
     base_name = os.path.basename(md_path).replace(".md", "_faq.md")
     faq_path = os.path.join(faq_dir, base_name)
     with open(faq_path, "w", encoding="utf-8") as f:
-        f.write(faq_md)
+        f.write(faq_output)
     return faq_path
 
 async def main() -> None:
@@ -74,8 +95,9 @@ async def main() -> None:
             url.get("url") for url in actor_input.get("start_urls", [{"url": "https://www.inhotel.io/"}])
         ]
         
-        # Get optional target language for FAQ generation
+        # Get optional target language and max_pages
         target_language = actor_input.get("target_language")
+        max_pages: int = int(actor_input.get("max_pages", 50))
         if target_language:
             Actor.log.info(f"Target language for FAQ generation: {target_language}")
 
@@ -85,6 +107,7 @@ async def main() -> None:
 
         parsed_url = urlparse(start_urls[0])
         base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        base_netloc = parsed_url.netloc
 
         change_detection_file = os.path.join("storage", "change_detection.json")
         os.makedirs(os.path.dirname(change_detection_file), exist_ok=True)
@@ -97,11 +120,44 @@ async def main() -> None:
         Actor.log.info(f"Loaded change detection data for {len(change_detection_data)} URLs")
         processed_count = 0
         skipped_count = 0
+        seen: Set[str] = set()
+
+        async def pre_nav(context: PlaywrightCrawlingContext, goto_options: dict):
+            page = context.page
+            async def route_handler(route):
+                request = route.request
+                url = request.url
+                rtype = request.resource_type
+                # Abort resource-heavy types
+                if rtype in ("image", "media", "font", "stylesheet"):
+                    await route.abort()
+                    return
+                # Abort media by extension
+                if is_media(url):
+                    await route.abort()
+                    return
+                # Abort blocked URLs
+                if is_blocked(url, base_netloc):
+                    await route.abort()
+                    return
+                # Abort third-party XHR/fetch
+                if rtype in ("xhr", "fetch") and not same_domain(url, base_domain):
+                    await route.abort()
+                    return
+                await route.continue_()
+            try:
+                await page.route("**/*", route_handler)
+            except Exception:
+                pass
+            # Faster navigation
+            goto_options["wait_until"] = "domcontentloaded"
+            goto_options["timeout"] = 10000
 
         crawler = PlaywrightCrawler(
-            max_requests_per_crawl=5000,
+            max_requests_per_crawl=max_pages,
             headless=True,
             browser_launch_options={"args": ["--disable-gpu"]},
+            pre_navigation_hooks=[pre_nav]
         )
 
         @crawler.router.default_handler
@@ -109,71 +165,74 @@ async def main() -> None:
             nonlocal processed_count, skipped_count
             url = context.request.url
             page = context.page
-            Actor.log.info(f"Visiting {url}")
+            depth = int(context.request.user_data.get("depth", 0)) if context.request.user_data else 0
+            Actor.log.info(f"Visiting {url} (depth={depth})")
 
             # Check if we have stored data for conditional requests
             stored_data = change_detection_data.get(url)
             
             if stored_data and isinstance(stored_data, dict):
-                # Try conditional request first
-                last_modified = stored_data.get("last_modified_header")
-                etag = stored_data.get("etag_header")
-                
-                if last_modified or etag:
-                    try:
-                        analysis = await change_detector.make_conditional_request(
-                            page, url, last_modified, etag
-                        )
-                        
-                        if analysis.get("is_not_modified"):
-                            Actor.log.info(f"Content not modified for {url} (304 response), skipping.")
-                            skipped_count += 1
-                            await context.enqueue_links()
-                            return
-                    except Exception as e:
-                        Actor.log.warning(f"Conditional request failed for {url}: {e}")
-                        # Fall back to full analysis
+                # Try conditional/lightweight checks
+                try:
+                    analysis = await change_detector.check_page_changes_lightweight(page, url, stored_data)
+                    if not analysis.get("needs_deep_check", True):
+                        Actor.log.info(f"Headers unchanged for {url}, skipping.")
+                        skipped_count += 1
+                        return
+                except Exception as e:
+                    Actor.log.warning(f"Lightweight check failed for {url}: {e}")
             
-            # Use advanced change detection to analyze the page
-            analysis = await change_detector.analyze_page_content(page, url)
+            try:
+                # Use efficient analysis
+                analysis = await change_detector.analyze_page_efficient(page, url, stored_data if isinstance(stored_data, dict) else None)
+            except Exception as e:
+                Actor.log.warning(f"Analysis failed for {url}: {e}")
+                return
             
             # Detect language from page content
-            content = await page.content()
+            try:
+                content = await page.content()
+            except Exception:
+                content = ""
             language_result = language_detector.detect_language(content, url)
             Actor.log.info(f"Language detected: {language_result.detected_lang} (confidence: {language_result.confidence:.2f}, source: {language_result.source})")
             
-            # Check if page should be re-crawled using intelligent heuristics
+            # Decide if page should be re-crawled using intelligent heuristics
             if stored_data and isinstance(stored_data, dict):
                 if not change_detector.should_recrawl_page(url, stored_data, analysis):
                     Actor.log.info(f"No significant changes for {url}, skipping.")
                     skipped_count += 1
-                    await context.enqueue_links()
                     return
             elif stored_data:  # Legacy format
                 stored_identifier = stored_data
                 if not change_detector.has_content_changed(stored_identifier, analysis["identifier"]):
                     Actor.log.info(f"No changes for {url}, skipping.")
                     skipped_count += 1
-                    await context.enqueue_links()
                     return
 
             processed_count += 1
-            content = await page.content()
-            markdown_content = md(content)
+            try:
+                markdown_content = md(content)
+            except Exception:
+                markdown_content = ""
 
             md_dir = os.path.join("storage", "datasets", "page_content")
             os.makedirs(md_dir, exist_ok=True)
-            parsed_url = urlparse(url)
-            path_parts = [part for part in parsed_url.path.strip('/').split('/') if part]
+            parsed_url_local = urlparse(url)
+            path_parts = [part for part in parsed_url_local.path.strip('/').split('/') if part]
             base_name = '_'.join(filter(None, [
                 ''.join(c if c.isalnum() or c in '-_' else '_' for c in (path_parts[-1] if path_parts else 'index'))
             ])) or 'index'
-            domain_prefix = parsed_url.netloc.replace('www.', '').split('.')[0]
+            domain_prefix = parsed_url_local.netloc.replace('www.', '').split('.')[0]
             md_filename = f"{domain_prefix}_{base_name}.md"
             md_path = os.path.join(md_dir, md_filename[:255])
 
             with open(md_path, "w", encoding="utf-8") as f:
-                f.write(f"# {await page.title()}\n\n")
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ""
+                f.write(f"# {title}\n\n")
                 f.write(f"**URL:** {url}\n\n")
                 f.write(markdown_content)
 
@@ -187,13 +246,13 @@ async def main() -> None:
 
             # Store enhanced change detection data
             change_detection_data[url] = {
-                "identifier": analysis["identifier"],
-                "last_updated": analysis["last_updated"],
-                "timestamp_source": analysis["timestamp_source"],
-                "content_hash": analysis["content_hash"],
-                "structured_hash": analysis["structured_hash"],
-                "last_modified_header": analysis["last_modified_header"],
-                "etag_header": analysis["etag_header"],
+                "identifier": analysis.get("identifier"),
+                "last_updated": analysis.get("last_updated"),
+                "timestamp_source": analysis.get("timestamp_source"),
+                "content_hash": analysis.get("content_hash"),
+                "structured_hash": analysis.get("structured_hash"),
+                "last_modified_header": analysis.get("last_modified_header"),
+                "etag_header": analysis.get("etag_header"),
                 "crawl_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "detected_language": language_result.detected_lang,
                 "language_confidence": language_result.confidence,
@@ -205,7 +264,50 @@ async def main() -> None:
             with open(change_detection_file, 'w') as f:
                 json.dump(change_detection_data, f, indent=2)
 
-            await context.enqueue_links()
+            # Enqueue links: same-domain, normalized, query-stripped, deduped, depth<=2, total<=max_pages
+            if processed_count < max_pages and depth < 2:
+                try:
+                    anchors = await page.query_selector_all("a[href]")
+                    for a in anchors:
+                        try:
+                            href = await a.get_attribute("href")
+                        except Exception:
+                            href = None
+                        if not href:
+                            continue
+                        if href.startswith('#'):
+                            continue
+                        if href.startswith('mailto:') or href.startswith('tel:'):
+                            continue
+                        full_url = urljoin(f"{parsed_url_local.scheme}://{parsed_url_local.netloc}", href) if not href.startswith('http') else href
+                        # Only http(s)
+                        scheme = urlparse(full_url).scheme
+                        if scheme not in ("http", "https"):
+                            Actor.log.info(f"Skip non-http(s): {full_url}")
+                            continue
+                        # Off-domain, media, or blocked
+                        if not same_domain(full_url, base_domain):
+                            Actor.log.info(f"Skip off-domain: {full_url}")
+                            continue
+                        if is_media(full_url):
+                            Actor.log.info(f"Skip media: {full_url}")
+                            continue
+                        if is_blocked(full_url, base_netloc):
+                            Actor.log.info(f"Skip blocked: {full_url}")
+                            continue
+                        normalized = strip_query(full_url)
+                        if normalized in seen or normalized in change_detection_data:
+                            continue
+                        seen.add(normalized)
+                        await context.add_requests([{
+                            "url": normalized,
+                            "uniqueKey": normalized,
+                            "userData": {"depth": depth + 1}
+                        }])
+                        if len(seen) >= max_pages:
+                            break
+                except Exception as e:
+                    Actor.log.warning(f"Failed to enqueue links from {url}: {e}")
 
         await crawler.run(start_urls)
 
@@ -218,6 +320,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 def page_data_to_markdown(page_data: dict) -> str:
     md = []

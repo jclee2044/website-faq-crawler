@@ -1,6 +1,0 @@
-.env
-__pycache__/
-apify_storage/
-app/
-storage/
-.gitignore
