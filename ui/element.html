@@ -1,0 +1,194 @@
+<!-- FAQ Embed (drop-in) -->
+<div id="faq-embed"
+     class="faq-embed"
+     data-faq-api=""          <!-- Optional: Base URL of your API (leave empty to use same-origin '/page-faqs') -->
+     data-faq-heading="Frequently Asked Questions"  <!-- Optional: Heading text -->
+     data-faq-lang="">        <!-- Optional: Force target language (e.g., 'en', 'es', 'fr'); blank lets API decide -->
+  <noscript>Please enable JavaScript to view FAQs.</noscript>
+</div>
+
+<style>
+  :root {
+    /* Base typography and layout */
+    --font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; /* Global font stack */
+    --base-font-size: 16px;       /* Default text size */
+    --line-height: 1.55;          /* Line spacing for body text */
+    --max-width: 720px;           /* Maximum width of the FAQ content container */
+
+    /* Theme colors */
+    --bg: #ffffff;                /* Page background color */
+    --text: #111111;              /* Default text color */
+    --muted-text: #444444;        /* Muted/secondary text color */
+    --heading: #111111;           /* Main heading color */
+    --question: #111111;          /* FAQ question text color */
+    --answer: #333333;            /* FAQ answer text color */
+    --accent: #0a66c2;            /* Accent color (links, focus outline) */
+    --border: #e5e7eb;            /* Border color for status box, etc. */
+
+    /* Heading (FAQ title) */
+    --heading-size: 28px;         /* Font size for the main heading */
+    --heading-weight: 800;        /* Font weight for the main heading */
+    --heading-margin-bottom: 18px;/* Spacing below the main heading */
+
+    /* Question styling */
+    --question-weight: 700;       /* Font weight for FAQ questions */
+    --question-size: 18px;        /* Font size for FAQ questions */
+    --question-margin-top: 16px;  /* Space above each FAQ question */
+    --question-margin-bottom: 6px;/* Space below each FAQ question */
+
+    /* Answer styling */
+    --answer-weight: 400;         /* Font weight for FAQ answers */
+    --answer-size: 16px;          /* Font size for FAQ answers */
+    --answer-italic: normal;      /* Answer text style (normal or italic) */
+    --answer-margin-bottom: 14px; /* Space below each FAQ answer */
+
+    /* Layout and chrome */
+    --block-gap: 10px;            /* Default gap between content blocks */
+    --outer-padding: 0px;         /* Outer padding around the FAQ container */
+    --status-bg: #f9fafb;         /* Background for the status line */
+    --status-radius: 8px;         /* Radius for the status line box */
+    --status-padding: 10px 12px;  /* Padding for the status line box */
+  }
+
+  /* Wrapper (scoped to .faq-embed so it won’t leak styles) */
+  .faq-embed {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-family);
+    font-size: var(--base-font-size);
+    line-height: var(--line-height);
+    max-width: var(--max-width);
+    margin: 0 auto;
+    padding: var(--outer-padding);
+  }
+
+  .faq-embed .faq-heading {
+    font-size: var(--heading-size);
+    font-weight: var(--heading-weight);
+    color: var(--heading);
+    margin: 0 0 var(--heading-margin-bottom);
+  }
+
+  .faq-embed .status {
+    display: block;
+    margin: 0 0 14px;
+    font-size: 13px;
+    color: var(--muted-text);
+    background: var(--status-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--status-radius);
+    padding: var(--status-padding);
+  }
+  .faq-embed .status.error { color: #b00020; }
+
+  .faq-embed .q {
+    font-size: var(--question-size);
+    font-weight: var(--question-weight);
+    color: var(--question);
+    margin: var(--question-margin-top) 0 var(--question-margin-bottom);
+    display: block;
+  }
+  .faq-embed .a {
+    font-size: var(--answer-size);
+    font-weight: var(--answer-weight);
+    color: var(--answer);
+    font-style: var(--answer-italic);
+    margin: 0 0 var(--answer-margin-bottom);
+  }
+</style>
+
+<script>
+(() => {
+  // ---- Config from DOM (non-technical users can just edit data-* attributes above) ----
+  const mountEl = document.getElementById('faq-embed');
+  if (!mountEl) return;
+
+  const API_BASE = (mountEl.dataset.faqApi || '').trim(); // e.g., "https://api.example.com" or "" for same-origin
+  const HEADING  = (mountEl.dataset.faqHeading || 'Frequently Asked Questions').trim();
+  const TARGET_LANGUAGE = (mountEl.dataset.faqLang || '').trim(); // e.g., "en", "es", "fr" — leave blank to let API decide
+  const PAGE_URL = window.location.href; // Auto-detected current page URL
+
+  // ---- Helpers ----
+  const escapeHTML = (s) => String(s)
+    .replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')
+    .replaceAll('"','&quot;').replaceAll("'","&#39;");
+
+  function setStatus(msg, isError=false) {
+    statusEl.textContent = msg || '';
+    statusEl.classList.toggle('error', !!isError);
+  }
+
+  function buildFaqHTML(items) {
+    let html = `<h2 class="faq-heading">${escapeHTML(HEADING)}</h2>`;
+    for (const it of (items || [])) {
+      const q = escapeHTML(it?.question || '');
+      const a = escapeHTML(it?.answer || '');
+      if (!q && !a) continue;
+      html += `<p class="q"><strong>${q}</strong></p>`;
+      html += `<p class="a">${a}</p>`;
+    }
+    return html;
+  }
+
+  async function fetchFaqsWithRetry(url, targetLanguage, { attempts=4, delayMs=2000 } = {}) {
+    let last;
+    for (let i = 0; i < attempts; i++) {
+      last = await fetchFaqs(url, targetLanguage);
+      if (!last) break; // hard failure
+      const faqs = Array.isArray(last?.faqs) ? last.faqs : [];
+      if (faqs.length > 0) return last;
+
+      const shouldRetry = last && (last.just_crawled || last.faq_generated);
+      if (!shouldRetry) break;
+
+      if (i < attempts - 1) {
+        setStatus(`Generating FAQs… retrying (${i + 1}/${attempts - 1})`);
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+    return last;
+  }
+
+  async function fetchFaqs(url, targetLanguage) {
+    const base = API_BASE ? API_BASE.replace(/\/$/,'') : ''; // allow same-origin
+    const endpoint = `${base}/page-faqs`;
+    const params = new URLSearchParams({ url });
+    if (targetLanguage) params.set('target_language', targetLanguage);
+
+    setStatus('Loading…');
+    try {
+      const res = await fetch(`${endpoint}?${params.toString()}`, { headers: { 'Accept': 'application/json' } });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+
+      // Render
+      const faqs = Array.isArray(json?.faqs) ? json.faqs : [];
+      faqEl.innerHTML = buildFaqHTML(faqs);
+
+      if (faqs.length === 0) {
+        setStatus(json?.message || 'No FAQs found yet. Generating…');
+      } else {
+        setStatus('Loaded.');
+      }
+      return json;
+    } catch (err) {
+      console.error(err);
+      setStatus(`Failed to load FAQs. ${err.message || err}`, true);
+      return null;
+    }
+  }
+
+  // ---- Mount structure ----
+  const statusEl = document.createElement('div');
+  statusEl.className = 'status';
+  const faqEl = document.createElement('section');
+  faqEl.setAttribute('aria-busy', 'false');
+
+  mountEl.innerHTML = '';
+  mountEl.appendChild(statusEl);
+  mountEl.appendChild(faqEl);
+
+  // ---- Kick off (auto-detect current page URL) ----
+  fetchFaqsWithRetry(PAGE_URL, TARGET_LANGUAGE);
+})();
+</script>

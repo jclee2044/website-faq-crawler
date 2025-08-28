@@ -15,21 +15,35 @@ import dotenv
 from change_detection import change_detector
 from language_detection import language_detector
 from url_filters import same_domain, strip_query, is_media, is_blocked
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load environment variables
 dotenv.load_dotenv()
 
 app = FastAPI(title="Website FAQ API", description="API for retrieving website last updated times and generating FAQs")
 
+# Allow cross-origin requests so the static ui.html can call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 def generate_faq_from_markdown(md_path: str, detected_language: str = "en", confidence: float = 1.0, target_language: str = None, model_name: str = "gemini-1.5-flash", script_hint: str = None) -> str:
     """Generate FAQ from markdown content using Google Gemini AI with language detection"""
+    print(f"[generate_faq] Starting FAQ generation for: {md_path}")
     api_key = os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY")
     if not api_key:
+        print("[generate_faq] ERROR: No API key found")
         raise ValueError("GOOGLE_GENERATIVE_AI_API_KEY not found in environment variables.")
     
     client = genai.Client(api_key=api_key)
     with open(md_path, "r", encoding="utf-8") as f:
         markdown_content = f.read()
+    
+    print(f"[generate_faq] Read markdown content, length: {len(markdown_content)}")
     
     # Extract title and URL from the markdown header written during crawl
     title = None
@@ -44,17 +58,20 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
     if not title:
         title = "FAQ"
     
+    print(f"[generate_faq] Extracted title: {title}")
+    print(f"[generate_faq] Extracted URL: {page_url}")
+    
     # Determine the language to use for FAQ generation
     if target_language:
         # Use explicit target language (highest priority)
         final_language = target_language
         language_instruction = f"LANGUAGE REQUIREMENT: Generate FAQs in {target_language.upper()} language. Both questions and answers must be in {target_language.upper()}."
-        print(f"Using target language override: {target_language}")
+        print(f"[generate_faq] Using target language override: {target_language}")
     else:
         # Use detected language with improved directive
         final_language = detected_language
         language_instruction = language_detector.create_language_directive(detected_language, confidence, script_hint)
-        print(f"Using detected language: {detected_language} (confidence: {confidence:.2f}, script_hint: {script_hint})")
+        print(f"[generate_faq] Using detected language: {detected_language} (confidence: {confidence:.2f}, script_hint: {script_hint})")
     
     prompt = (
         f"""
@@ -65,12 +82,20 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
         Markdown content:\n\n""" + markdown_content
     )
     
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt
-    )
-    
-    faq_md = response.text
+    print(f"[generate_faq] Sending request to Gemini API...")
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt
+        )
+        
+        faq_md = response.text
+        print(f"[generate_faq] Received response from Gemini, length: {len(faq_md)}")
+        print(f"[generate_faq] Response preview: {faq_md[:200]}...")
+        
+    except Exception as e:
+        print(f"[generate_faq] ERROR calling Gemini API: {e}")
+        raise e
 
     # Prepend the original page title and URL to the saved FAQ file for reliable source mapping
     header_lines = f"# {title}\n\n"
@@ -83,9 +108,11 @@ def generate_faq_from_markdown(md_path: str, detected_language: str = "en", conf
     base_name = os.path.basename(md_path).replace(".md", "_faq.md")
     faq_path = os.path.join(faq_dir, base_name)
     
+    print(f"[generate_faq] Saving FAQ to: {faq_path}")
     with open(faq_path, "w", encoding="utf-8") as f:
         f.write(faq_output)
     
+    print(f"[generate_faq] FAQ generation completed successfully")
     return faq_path
 
 async def crawl_and_generate_faq(url: str, skip_faq: bool = False, target_language: str = None) -> Dict[str, str]:
@@ -533,9 +560,13 @@ def find_faq_file_for_url(url: str) -> Optional[str]:
 
 def read_faq_content(faq_path: str) -> List[Dict[str, str]]:
     """Read and parse FAQ content from markdown file"""
+    print(f"[read_faq] Reading FAQ content from: {faq_path}")
     try:
         with open(faq_path, 'r', encoding='utf-8') as f:
             content = f.read()
+        
+        print(f"[read_faq] Read content, length: {len(content)}")
+        print(f"[read_faq] Content preview: {content[:500]}...")
         
         # Simple parsing of markdown FAQ format
         faqs = []
@@ -545,7 +576,9 @@ def read_faq_content(faq_path: str) -> List[Dict[str, str]]:
         
         for line in lines:
             line = line.strip()
-            if line.startswith('**') and line.endswith('**'):
+            # Handle both formats: "**Question**" and "# **Question**"
+            if (line.startswith('**') and line.endswith('**')) or \
+               (line.startswith('# **') and line.endswith('**')):
                 # Save previous FAQ if exists
                 if current_question and current_answer:
                     faqs.append({
@@ -553,8 +586,8 @@ def read_faq_content(faq_path: str) -> List[Dict[str, str]]:
                         "answer": ' '.join(current_answer).strip()
                     })
                 
-                # Start new FAQ
-                current_question = line.strip('*')
+                # Start new FAQ - strip # and ** from the question
+                current_question = line.replace('# ', '').strip('*')
                 current_answer = []
             elif line and current_question:
                 current_answer.append(line)
@@ -566,8 +599,13 @@ def read_faq_content(faq_path: str) -> List[Dict[str, str]]:
                 "answer": ' '.join(current_answer).strip()
             })
         
+        print(f"[read_faq] Parsed {len(faqs)} FAQs")
+        for i, faq in enumerate(faqs[:3]):  # Show first 3 FAQs
+            print(f"[read_faq] FAQ {i+1}: {faq.get('question', '')[:50]}...")
+        
         return faqs
     except Exception as e:
+        print(f"[read_faq] ERROR reading FAQ file: {e}")
         return [{"error": f"Failed to read FAQ file: {str(e)}"}]
 
 def get_all_faqs_for_domain(base_url: str) -> List[Dict[str, str]]:
@@ -711,7 +749,8 @@ async def last_updated(
 @app.get("/page-faqs")
 async def page_faqs(
     url: str = Query(..., description="The URL to get FAQs for"),
-    target_language: str = Query(None, description="Optional target language for FAQ generation (ISO code, e.g., 'es', 'fr')")
+    target_language: str = Query(None, description="Optional target language for FAQ generation (ISO code, e.g., 'es', 'fr')"),
+    force_refresh: bool = Query(False, description="Force refresh of FAQ content")
 ):
     """
     Get the last updated time and FAQs for a specific page.
@@ -720,11 +759,13 @@ async def page_faqs(
     If the URL has been crawled but no FAQ exists, it will generate the FAQ on the spot.
     Returns both the last updated timestamp and the generated FAQs for the page.
     """
+    print(f"[page-faqs] Processing URL: {url}, force_refresh: {force_refresh}")
     change_data = get_change_detection_data()
     just_crawled = False
     faq_generated = False
     
     if url not in change_data:
+        print(f"[page-faqs] URL not found in change data, crawling...")
         # URL not found, crawl it automatically
         try:
             crawl_result = await crawl_and_generate_faq(url, skip_faq=False, target_language=target_language)  # Generate FAQ
@@ -733,9 +774,12 @@ async def page_faqs(
             faq_path = crawl_result.get("faq_path")
             just_crawled = True
             faq_generated = True
+            print(f"[page-faqs] Crawl completed. FAQ path: {faq_path}")
         except Exception as e:
+            print(f"[page-faqs] Crawl failed: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to crawl URL: {str(e)}")
     else:
+        print(f"[page-faqs] URL found in change data")
         url_data = change_data[url]
         
         # Handle both new and legacy data formats
@@ -748,9 +792,11 @@ async def page_faqs(
             timestamp_source = "legacy"
         
         faq_path = find_faq_file_for_url(url)
+        print(f"[page-faqs] Found FAQ path: {faq_path}")
         
         # If FAQ doesn't exist but we have page data, generate it on the spot
         if not faq_path:
+            print(f"[page-faqs] No FAQ found, attempting to generate...")
             try:
                 # Find the markdown file for this URL
                 parsed_url = urlparse(url)
@@ -762,8 +808,10 @@ async def page_faqs(
                 md_filename = f"{domain_prefix}_{base_name}.md"
                 md_dir = os.path.join("storage", "datasets", "page_content")
                 md_path = os.path.join(md_dir, md_filename[:255])
+                print(f"[page-faqs] Looking for markdown file: {md_path}")
                 
                 if os.path.exists(md_path):
+                    print(f"[page-faqs] Markdown file found, generating FAQ...")
                     # Get language info from change detection data
                     detected_lang = url_data.get("detected_language", "en")
                     confidence = url_data.get("language_confidence", 1.0)
@@ -771,7 +819,9 @@ async def page_faqs(
                     
                     faq_path = generate_faq_from_markdown(md_path, detected_lang, confidence, target_language, script_hint=script_hint)
                     faq_generated = True
+                    print(f"[page-faqs] FAQ generated: {faq_path}")
                 else:
+                    print(f"[page-faqs] No markdown file found, re-crawling...")
                     # No markdown file found, need to re-crawl
                     crawl_result = await crawl_and_generate_faq(url, skip_faq=False, target_language=target_language)
                     last_updated_time = crawl_result.get("last_updated")
@@ -779,10 +829,14 @@ async def page_faqs(
                     faq_path = crawl_result.get("faq_path")
                     just_crawled = True
                     faq_generated = True
+                    print(f"[page-faqs] Re-crawl completed. FAQ path: {faq_path}")
             except Exception as e:
+                print(f"[page-faqs] FAQ generation failed: {e}")
                 raise HTTPException(status_code=500, detail=f"Failed to generate FAQ: {str(e)}")
     
+    print(f"[page-faqs] Final FAQ path: {faq_path}")
     if not faq_path:
+        print(f"[page-faqs] No FAQ path available, returning empty result")
         return {
             "url": url,
             "last_updated": last_updated_time,
@@ -793,7 +847,20 @@ async def page_faqs(
             "faq_generated": faq_generated
         }
     
+    print(f"[page-faqs] Reading FAQ content from: {faq_path}")
     faqs = read_faq_content(faq_path)
+    print(f"[page-faqs] Read {len(faqs)} FAQs")
+    
+    # If force_refresh is true and we got empty FAQs, try to re-read the file
+    if force_refresh and len(faqs) == 0:
+        print(f"[page-faqs] Force refresh requested and no FAQs found, trying to re-read file...")
+        # Clear any potential caching and re-read
+        import importlib
+        import main
+        importlib.reload(main)
+        from main import read_faq_content
+        faqs = read_faq_content(faq_path)
+        print(f"[page-faqs] After force refresh, read {len(faqs)} FAQs")
     
     return {
         "url": url,
@@ -870,3 +937,4 @@ async def site_faqs(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+# Test reload

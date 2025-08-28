@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FAQs Viewer — /page-faqs</title>
+  <style>
+    /* All styling comes from CSS variables set by JS from the CONFIG object */
+    :root {
+  /* Base typography and layout */
+  --font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji"; /* Global font stack */
+  --base-font-size: 16px;       /* Default text size */
+  --line-height: 1.55;          /* Line spacing for body text */
+  --max-width: 720px;           /* Maximum width of the FAQ content container */
+
+  /* Theme colors */
+  --bg: #ffffff;                /* Page background color */
+  --text: #111111;              /* Default text color */
+  --muted-text: #444444;        /* Muted/secondary text color */
+  --heading: #111111;           /* Main heading color */
+  --question: #111111;          /* FAQ question text color */
+  --answer: #333333;            /* FAQ answer text color */
+  --accent: #0a66c2;            /* Accent color (buttons, highlights, focus) */
+  --border: #e5e7eb;            /* Border color for inputs, containers */
+
+  /* Heading (FAQ title) */
+  --heading-size: 28px;         /* Font size for the main heading */
+  --heading-weight: 800;        /* Font weight for the main heading */
+  --heading-margin-bottom: 18px;/* Spacing below the main heading */
+
+  /* Question styling */
+  --question-weight: 700;       /* Font weight for FAQ questions */
+  --question-size: 18px;        /* Font size for FAQ questions */
+  --question-margin-top: 16px;  /* Space above each FAQ question */
+  --question-margin-bottom: 6px;/* Space below each FAQ question */
+
+  /* Answer styling */
+  --answer-weight: 400;         /* Font weight for FAQ answers */
+  --answer-size: 16px;          /* Font size for FAQ answers */
+  --answer-italic: normal;      /* Answer text style (normal or italic) */
+  --answer-margin-bottom: 14px; /* Space below each FAQ answer */
+
+  /* Layout and controls */
+  --block-gap: 10px;            /* Default gap between content blocks */
+  --outer-padding: 20px;        /* Page padding around the FAQ container */
+  --control-gap: 8px;           /* Space between toolbar controls (input, button) */
+  --control-radius: 10px;       /* Border radius for inputs and buttons */
+  --control-padding: 10px 12px; /* Inner padding for inputs and buttons */
+}
+
+
+    html, body {
+      height: 100%;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-family);
+      font-size: var(--base-font-size);
+      line-height: var(--line-height);
+      display: grid;
+      place-items: start center;
+      padding: var(--outer-padding);
+    }
+
+    .app {
+      width: 100%;
+      max-width: var(--max-width);
+    }
+    .toolbar {
+      display: flex;
+      gap: var(--control-gap);
+      margin-bottom: 18px;
+      align-items: center;
+      flex-wrap: wrap; /* allow wrapping on small screens */
+    }
+
+    .toolbar input[type="url"],
+    .toolbar input[type="text"] {
+      border: 1px solid var(--border);
+      border-radius: var(--control-radius);
+      padding: var(--control-padding);
+      background: #fff;
+      color: var(--text);
+      outline: none;
+    }
+
+    .toolbar input[type="url"] {
+      flex: 1 1 320px; /* grow/shrink and prefer a wide base */
+      min-width: 220px;
+    }
+
+    .toolbar .target-lang {
+      flex: 0 0 120px; /* fixed width for lang box */
+      width: 120px;
+    }
+
+    .toolbar input[type="url"]:focus,
+    .toolbar input[type="text"]:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+    }
+
+    .toolbar button {
+      border: 1px solid var(--border);
+      border-radius: var(--control-radius);
+      padding: var(--control-padding);
+      background: var(--accent);
+      color: white;
+      cursor: pointer;
+      font-weight: 600;
+      white-space: nowrap; /* keep label on one line */
+    }
+
+    .status {
+      font-size: 13px;
+      color: var(--muted-text);
+      margin: 6px 2px 14px;
+      min-height: 1em;
+    }
+
+    /* FAQ output */
+    .faq { display: block; }
+
+    .faq h1 {
+      font-size: var(--heading-size);
+      font-weight: var(--heading-weight);
+      color: var(--heading);
+      margin: 0 0 var(--heading-margin-bottom);
+    }
+
+    .faq .q {
+      font-size: var(--question-size);
+      font-weight: var(--question-weight);
+      color: var(--question);
+      margin: var(--question-margin-top) 0 var(--question-margin-bottom);
+      display: block;
+    }
+    .faq .a {
+      font-size: var(--answer-size);
+      font-weight: var(--answer-weight);
+      color: var(--answer);
+      font-style: var(--answer-italic);
+      margin: 0 0 var(--answer-margin-bottom);
+    }
+
+    .meta { margin-bottom: 14px; color: var(--muted-text); font-size: 13px; }
+
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="toolbar">
+      <input id="urlInput" type="url" placeholder="Paste a page URL to load FAQs (e.g. https://example.com/article)" />
+      <input id="langInput" class="target-lang" type="text" placeholder="lang (opt)" title="Optional ISO code like 'en', 'es', 'fr'" />
+      <button id="loadBtn" type="button">Load FAQs</button>
+    </div>
+    <div id="status" class="status" aria-live="polite"></div>
+
+    <section id="faq" class="faq" aria-busy="false"></section>
+  </div>
+
+  <script>
+    /* ====================
+       Customize everything here
+       ==================== */
+    const CONFIG = {
+      apiBase: "http://localhost:8000", // FastAPI server base
+      headingText: "Frequently Asked Questions", // Main heading text
+      defaultUrl: "", // Optional: prefill a URL here for auto-load
+      targetLanguage: "", // Optional: 'es', 'fr', etc. If blank, API decides
+      // themeMode: "config" uses CONFIG.theme to set CSS variables.
+      // themeMode: "css" leaves CSS variables from <style> untouched.
+      themeMode: "css",
+      theme: {
+        fontFamily: "Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji",
+        baseFontSize: "16px",
+        lineHeight: "1.6",
+        maxWidth: "760px",
+
+        colors: {
+          bg: "#ffffff",
+          text: "#111111",
+          mutedText: "#555555",
+          heading: "#111111",
+          question: "#111111",
+          answer: "#333333",
+          accent: "#0a66c2",
+          border: "#e5e7eb",
+        },
+
+        heading: { size: "32px", weight: 800, marginBottom: "18px" },
+        question: { size: "18px", weight: 700, marginTop: "16px", marginBottom: "6px" },
+        answer: { size: "16px", weight: 400, italic: false, marginBottom: "14px" },
+        layout: { outerPadding: "20px", controlGap: "8px", controlRadius: "10px", controlPadding: "10px 12px" },
+      },
+    };
+
+    // Apply CONFIG.theme -> CSS variables
+    function applyTheme() {
+      if (CONFIG.themeMode !== "config") return; // Respect CSS set in <style>
+      const r = document.documentElement;
+      const t = CONFIG.theme;
+      r.style.setProperty("--font-family", t.fontFamily);
+      r.style.setProperty("--base-font-size", t.baseFontSize);
+      r.style.setProperty("--line-height", t.lineHeight);
+      r.style.setProperty("--max-width", t.maxWidth);
+
+      r.style.setProperty("--bg", t.colors.bg);
+      r.style.setProperty("--text", t.colors.text);
+      r.style.setProperty("--muted-text", t.colors.mutedText);
+      r.style.setProperty("--heading", t.colors.heading);
+      r.style.setProperty("--question", t.colors.question);
+      r.style.setProperty("--answer", t.colors.answer);
+      r.style.setProperty("--accent", t.colors.accent);
+      r.style.setProperty("--border", t.colors.border);
+
+      r.style.setProperty("--heading-size", t.heading.size);
+      r.style.setProperty("--heading-weight", String(t.heading.weight));
+      r.style.setProperty("--heading-margin-bottom", t.heading.marginBottom);
+
+      r.style.setProperty("--question-size", t.question.size);
+      r.style.setProperty("--question-weight", String(t.question.weight));
+      r.style.setProperty("--question-margin-top", t.question.marginTop);
+      r.style.setProperty("--question-margin-bottom", t.question.marginBottom);
+
+      r.style.setProperty("--answer-size", t.answer.size);
+      r.style.setProperty("--answer-weight", String(t.answer.weight));
+      r.style.setProperty("--answer-italic", t.answer.italic ? "italic" : "normal");
+      r.style.setProperty("--answer-margin-bottom", t.answer.marginBottom);
+
+      r.style.setProperty("--outer-padding", t.layout.outerPadding);
+      r.style.setProperty("--control-gap", t.layout.controlGap);
+      r.style.setProperty("--control-radius", t.layout.controlRadius);
+      r.style.setProperty("--control-padding", t.layout.controlPadding);
+    }
+
+    // Tiny sanitizer for text nodes
+    const escapeHTML = (s) => String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+
+    function setStatus(msg, isError = false) {
+      const el = document.getElementById("status");
+      el.textContent = msg || "";
+      el.classList.toggle("error", !!isError);
+    }
+
+    function setBusy(busy) {
+      const faq = document.getElementById("faq");
+      faq.setAttribute("aria-busy", busy ? "true" : "false");
+    }
+
+    function buildFaqHTML(faqs) {
+      let html = "";
+      html += `<h1>${escapeHTML(CONFIG.headingText)}</h1>`;
+      for (const item of faqs) {
+        const q = escapeHTML(item.question || "");
+        const a = escapeHTML(item.answer || "");
+        if (!q && !a) continue;
+        html += `<p class="q"><strong>${q}</strong></p>`;
+        html += `<p class="a">${a}</p>`;
+      }
+      return html;
+    }
+
+    function renderFaqs(responseJson) {
+      const target = document.getElementById("faq");
+      const { faqs = [] } = responseJson || {};
+      target.innerHTML = buildFaqHTML(faqs);
+    }
+
+    async function fetchFaqs(url, targetLanguage) {
+      const base = CONFIG.apiBase.replace(/\/$/, "");
+      const params = new URLSearchParams({ url });
+      if (targetLanguage) params.set("target_language", targetLanguage);
+      const full = `${base}/page-faqs?${params.toString()}`;
+
+      setBusy(true);
+      setStatus("Loading…");
+      try {
+        const res = await fetch(full, { headers: { "Accept": "application/json" } });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+
+        // If we have a FAQ file but empty FAQs array, try to get the FAQs directly
+        if (json?.faq_file && (!json?.faqs || json.faqs.length === 0)) {
+          setStatus("Reading FAQ file...");
+          const retryParams = new URLSearchParams({ url });
+          if (targetLanguage) retryParams.set("target_language", targetLanguage);
+          retryParams.set("force_refresh", "true");
+          const retryFull = `${base}/page-faqs?${retryParams.toString()}`;
+          const retryRes = await fetch(retryFull, { headers: { "Accept": "application/json" } });
+          if (retryRes.ok) {
+            const retryJson = await retryRes.json();
+            if (retryJson?.faqs && retryJson.faqs.length > 0) {
+              json.faqs = retryJson.faqs;
+            }
+          }
+        }
+
+        renderFaqs(json);
+        const faqs = Array.isArray(json?.faqs) ? json.faqs : [];
+        setStatus(faqs.length === 0 ? (json?.message || "No FAQs found yet. Generating…") : "Loaded.");
+        return json;
+      } catch (err) {
+        setStatus(`Failed to load FAQs. ${err.message || err}`, true);
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function fetchFaqsWithRetry(url, targetLanguage, { attempts = 5, delayMs = 2500 } = {}) {
+      let last;
+      for (let i = 0; i < attempts; i++) {
+        last = await fetchFaqs(url, targetLanguage);
+        if (!last) break;
+        const faqs = Array.isArray(last?.faqs) ? last.faqs : [];
+        if (faqs.length > 0) { setStatus("Loaded."); return last; }
+
+        const shouldRetry = last && (
+          last.just_crawled ||
+          last.faq_generated ||
+          (last.message && last.message.includes("could not generate"))
+        );
+
+        if (!shouldRetry) { setStatus("No FAQs available for this page."); break; }
+        if (i < attempts - 1) {
+          setStatus(`Generating FAQs… retrying (${i + 1}/${attempts})`);
+          await new Promise(r => setTimeout(r, delayMs));
+        }
+      }
+      if (last && Array.isArray(last.faqs) && last.faqs.length === 0) {
+        setStatus("No FAQs generated after multiple attempts.");
+      }
+      return last;
+    }
+
+    function wireUI() {
+      applyTheme();
+      const urlInput = document.getElementById("urlInput");
+      const langInput = document.getElementById("langInput");
+      const btn = document.getElementById("loadBtn");
+
+      // Prefill from CONFIG or URL ?url=…&lang=…
+      const sp = new URLSearchParams(location.search);
+      const startUrl = sp.get("url") || CONFIG.defaultUrl || "";
+      const startLang = sp.get("lang") || CONFIG.targetLanguage || "";
+      if (startUrl) urlInput.value = startUrl;
+      if (startLang) langInput.value = startLang;
+
+      btn.addEventListener("click", async () => {
+        const u = urlInput.value.trim();
+        const lang = langInput.value.trim();
+        if (!u) { setStatus("Please enter a page URL.", true); return; }
+        await fetchFaqsWithRetry(u, lang);
+      });
+
+      urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") btn.click(); });
+
+      if (startUrl) fetchFaqsWithRetry(startUrl, startLang);
+    }
+
+    wireUI();
+  </script>
+</body>
+</html>
