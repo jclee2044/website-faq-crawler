@@ -854,11 +854,7 @@ async def page_faqs(
     # If force_refresh is true and we got empty FAQs, try to re-read the file
     if force_refresh and len(faqs) == 0:
         print(f"[page-faqs] Force refresh requested and no FAQs found, trying to re-read file...")
-        # Clear any potential caching and re-read
-        import importlib
-        import main
-        importlib.reload(main)
-        from main import read_faq_content
+        # Simply re-read the file without module reloading
         faqs = read_faq_content(faq_path)
         print(f"[page-faqs] After force refresh, read {len(faqs)} FAQs")
     
