@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import List, Dict, Optional, Any
 from urllib.parse import urlparse, urljoin
 from fastapi import FastAPI, Query, HTTPException
+from fastapi.staticfiles import StaticFiles
 from playwright.async_api import async_playwright
 from markdownify import markdownify as md
 from google import genai
@@ -30,6 +31,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 def generate_faq_from_markdown(md_path: str, detected_language: str = "en", confidence: float = 1.0, target_language: str = None, model_name: str = "gemini-1.5-flash", script_hint: str = None) -> str:
     """Generate FAQ from markdown content using Google Gemini AI with language detection"""
