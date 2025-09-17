@@ -152,7 +152,8 @@
       const timeoutId = setTimeout(() => controller.abort(), this.requestTimeout);
 
       try {
-        const params = new URLSearchParams({ url: encodeURIComponent(url) });
+        const params = new URLSearchParams();
+        params.set('url', url);
         if (lang) params.set('target_language', lang);
         if (forceRefresh) params.set('force_refresh', 'true');
 
@@ -517,5 +518,26 @@
   // Register the custom element
   if (!customElements.get('faq-widget')) {
     customElements.define('faq-widget', FAQWidget);
+
+  // Auto-mount: create and insert <faq-widget> from script data attributes
+  (function() {
+    const s = document.currentScript;
+    if (!s || !s.dataset) return;
+    const targetSel = s.dataset.target;
+    if (!targetSel) return;
+    const mountPoint = document.querySelector(targetSel);
+    if (!mountPoint) return;
+    const el = document.createElement('faq-widget');
+    if (s.dataset.api) el.setAttribute('data-api', s.dataset.api);
+    if (s.dataset.url) el.setAttribute('data-url', s.dataset.url);
+    if (s.dataset.lang) el.setAttribute('data-lang', s.dataset.lang);
+    if (s.dataset.heading) el.setAttribute('data-heading', s.dataset.heading);
+    if (s.dataset.jsonld === 'off') el.setAttribute('data-jsonld', 'off');
+    if (s.dataset.max && !Number.isNaN(Number(s.dataset.max))) {
+      el.setAttribute('data-max', String(Math.max(1, Number(s.dataset.max))));
+    }
+    mountPoint.appendChild(el);
+  })();
+
   }
 })();
