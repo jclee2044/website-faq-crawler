@@ -3,7 +3,7 @@
 
   class FAQWidget extends HTMLElement {
     static get observedAttributes() {
-      return ['data-api', 'data-url', 'data-lang', 'data-heading', 'data-jsonld'];
+      return ['data-api', 'data-url', 'data-lang', 'data-heading', 'data-jsonld', 'data-config'];
     }
 
     constructor() {
@@ -22,7 +22,12 @@
       this.initializeWidget();
     }
 
-    attributeChangedCallback() {
+    attributeChangedCallback(name, oldValue, newValue) {
+      if (name === 'data-config') {
+        const config = this.parseConfig(newValue || '');
+        this.applyConfig(config);
+        return;
+      }
       if (this.shadowRoot) {
         this.initializeWidget();
       }
@@ -35,11 +40,16 @@
       const lang = this.getAttribute('data-lang');
       const heading = this.getAttribute('data-heading') || 'Frequently Asked Questions';
       const jsonld = this.getAttribute('data-jsonld') !== 'off';
+      const configStr = this.getAttribute('data-config') || '';
+      const config = this.parseConfig(configStr);
 
       // Attach shadow DOM
       if (!this.shadowRoot) {
         this.attachShadow({ mode: 'open' });
       }
+
+      // Apply styling config via CSS variables on host
+      this.applyConfig(config);
 
       // Check for inline JSON first
       const inlineJson = this.getInlineJson();
@@ -87,6 +97,37 @@
         console.warn('FAQ Widget: Invalid inline JSON, falling back to API');
         return null;
       }
+    }
+
+    parseConfig(configStr) {
+      if (!configStr) return {};
+      try {
+        const parsed = JSON.parse(configStr);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch (e) {
+        console.warn('FAQ Widget: Invalid data-config JSON, ignoring');
+        return {};
+      }
+    }
+
+    applyConfig(config) {
+      if (!config || typeof config !== 'object') return;
+      const mappings = {
+        font_family: '--faq-font-family',
+        header_color: '--faq-header-color',
+        header_background_color: '--faq-header-bg',
+        title_font_weight: '--faq-title-weight',
+        title_font_size: '--faq-title-size',
+        body_background_color: '--faq-body-bg',
+        message_font_size: '--faq-message-size'
+      };
+      Object.keys(mappings).forEach(key => {
+        const cssVar = mappings[key];
+        const value = config[key];
+        if (typeof value === 'string' && value.trim() !== '') {
+          this.style.setProperty(cssVar, value);
+        }
+      });
     }
 
     async loadFaqsWithRetry(api, url, lang, heading, jsonld) {
@@ -187,7 +228,7 @@
         <style>
           :host {
             display: block;
-            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            font-family: var(--faq-font-family, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif);
             font-size: 16px;
             line-height: 1.5;
             color: #333;
@@ -197,13 +238,18 @@
           .faq-container {
             border-radius: 8px;
             overflow: hidden;
+            background: var(--faq-body-bg, transparent);
+          }
+          
+          .faq-header {
+            background: var(--faq-header-bg, transparent);
           }
           
           .faq-heading {
-            font-size: 24px;
-            font-weight: 600;
+            font-size: var(--faq-title-size, 24px);
+            font-weight: var(--faq-title-weight, 600);
             margin: 0 0 16px 0;
-            color: #111;
+            color: var(--faq-header-color, #111);
           }
           
           .faq-item {
@@ -221,7 +267,7 @@
             background: #fff;
             border: none;
             text-align: left;
-            font-size: 16px;
+            font-size: var(--faq-message-size, 16px);
             font-weight: 500;
             color: #111;
             cursor: pointer;
@@ -270,6 +316,7 @@
           .faq-answer-content {
             color: #374151;
             margin: 0;
+            font-size: var(--faq-message-size, 16px);
           }
           
           .status {
@@ -288,7 +335,9 @@
         </style>
         
         <div class="faq-container" aria-busy="false">
-          <h2 class="faq-heading">${this.escapeHtml(heading)}</h2>
+          <div class="faq-header">
+            <h2 class="faq-heading">${this.escapeHtml(heading)}</h2>
+          </div>
           ${validFaqs.length > 0 ? this.buildAccordion(validFaqs) : '<div class="status">No FAQs available</div>'}
         </div>
       `;
@@ -393,7 +442,7 @@
         <style>
           :host {
             display: block;
-            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            font-family: var(--faq-font-family, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif);
             font-size: 16px;
             line-height: 1.5;
             color: #333;
@@ -402,13 +451,18 @@
           .faq-container {
             border-radius: 8px;
             overflow: hidden;
+            background: var(--faq-body-bg, transparent);
+          }
+          
+          .faq-header {
+            background: var(--faq-header-bg, transparent);
           }
           
           .faq-heading {
-            font-size: 24px;
-            font-weight: 600;
+            font-size: var(--faq-title-size, 24px);
+            font-weight: var(--faq-title-weight, 600);
             margin: 0 0 16px 0;
-            color: #111;
+            color: var(--faq-header-color, #111);
           }
           
           .status {
@@ -422,7 +476,9 @@
         </style>
         
         <div class="faq-container" aria-busy="true">
-          <h2 class="faq-heading">${this.escapeHtml(heading)}</h2>
+          <div class="faq-header">
+            <h2 class="faq-heading">${this.escapeHtml(heading)}</h2>
+          </div>
           <div class="status">Loading FAQs...</div>
         </div>
       `;
@@ -440,7 +496,7 @@
         <style>
           :host {
             display: block;
-            font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            font-family: var(--faq-font-family, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif);
             font-size: 16px;
             line-height: 1.5;
             color: #333;
@@ -535,6 +591,9 @@
     if (s.dataset.jsonld === 'off') el.setAttribute('data-jsonld', 'off');
     if (s.dataset.max && !Number.isNaN(Number(s.dataset.max))) {
       el.setAttribute('data-max', String(Math.max(1, Number(s.dataset.max))));
+    }
+    if (s.dataset.config) {
+      el.setAttribute('data-config', s.dataset.config);
     }
     mountPoint.appendChild(el);
   })();
