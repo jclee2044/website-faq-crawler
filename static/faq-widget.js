@@ -38,10 +38,11 @@
       const api = this.getAttribute('data-api') || 'http://localhost:8000';
       const url = this.getAttribute('data-url');
       const lang = this.getAttribute('data-lang');
-      const heading = this.getAttribute('data-heading') || 'Frequently Asked Questions';
       const jsonld = this.getAttribute('data-jsonld') !== 'off';
       const configStr = this.getAttribute('data-config') || '';
       const config = this.parseConfig(configStr);
+      const headingAttr = this.getAttribute('data-heading');
+      const heading = headingAttr || (config && typeof config.title_text === 'string' && config.title_text.trim() ? config.title_text : 'Frequently Asked Questions');
 
       // Attach shadow DOM
       if (!this.shadowRoot) {
@@ -119,7 +120,19 @@
         title_font_weight: '--faq-title-weight',
         title_font_size: '--faq-title-size',
         body_background_color: '--faq-body-bg',
-        message_font_size: '--faq-message-size'
+        message_font_size: '--faq-message-size',
+        // New typography controls
+        question_font_size: '--faq-q-size',
+        answer_font_size: '--faq-a-size',
+        question_font_color: '--faq-q-color',
+        answer_font_color: '--faq-a-color',
+        question_font_weight: '--faq-q-weight',
+        answer_font_weight: '--faq-a-weight',
+        question_font_style: '--faq-q-style',
+        answer_font_style: '--faq-a-style',
+        question_font_family: '--faq-q-font',
+        answer_font_family: '--faq-a-font',
+        hover_background_color: '--faq-hover-bg'
       };
       Object.keys(mappings).forEach(key => {
         const cssVar = mappings[key];
@@ -128,6 +141,14 @@
           this.style.setProperty(cssVar, value);
         }
       });
+
+      // Live update heading text when title_text provided (data-heading still takes precedence during render)
+      if (typeof config.title_text === 'string' && config.title_text.trim() && this.shadowRoot) {
+        const headingEl = this.shadowRoot.querySelector('.faq-heading');
+        if (headingEl && !this.getAttribute('data-heading')) {
+          headingEl.textContent = config.title_text;
+        }
+      }
     }
 
     async loadFaqsWithRetry(api, url, lang, heading, jsonld) {
@@ -267,9 +288,11 @@
             background: #fff;
             border: none;
             text-align: left;
-            font-size: var(--faq-message-size, 16px);
-            font-weight: 500;
-            color: #111;
+            font-size: var(--faq-q-size, var(--faq-message-size, 16px));
+            font-weight: var(--faq-q-weight, 500);
+            color: var(--faq-q-color, #111);
+            font-style: var(--faq-q-style, normal);
+            font-family: var(--faq-q-font, var(--faq-font-family, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif));
             cursor: pointer;
             display: flex;
             justify-content: space-between;
@@ -278,7 +301,7 @@
           }
           
           .faq-question:hover {
-            background: #f9fafb;
+            background: var(--faq-hover-bg, #f9fafb);
           }
           
           .faq-question:focus {
@@ -314,9 +337,12 @@
           }
           
           .faq-answer-content {
-            color: #374151;
+            color: var(--faq-a-color, #374151);
             margin: 0;
-            font-size: var(--faq-message-size, 16px);
+            font-size: var(--faq-a-size, var(--faq-message-size, 16px));
+            font-weight: var(--faq-a-weight, 400);
+            font-style: var(--faq-a-style, normal);
+            font-family: var(--faq-a-font, var(--faq-font-family, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif));
           }
           
           .status {
